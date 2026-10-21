@@ -175,8 +175,8 @@ class CompletionHandler(BaseHTTPRequestHandler):
         try:
             if self.path.startswith("/v1/cancel/"):
                 request_id = self.path.removeprefix("/v1/cancel/")
-                accepted = self.server.engine.cancel(request_id)
-                self._json(200 if accepted else 404, {"request_id": request_id, "cancelled": accepted})
+                observation = self.server.engine.cancel_with_observation(request_id)
+                self._json(200 if observation["cancelled"] else 404, observation)
                 return
             if self.path != "/v1/completions":
                 self._error(404, "unknown route")

@@ -484,3 +484,43 @@ def test_shutdown_preserves_previously_accepted_cancel_reason():
     assert pending.step()["finish_reason"] == "cancelled"
     model.close()
     assert_clean(model)
+
+
+def test_cancel_observation_and_terminal_peers_capture_exact_registry_boundary():
+    model = engine()
+    victim = model.submit([1], max_tokens=4, request_id="victim")
+    peer = model.submit([3], max_tokens=4, request_id="peer")
+    acknowledgement = model.cancel_with_observation("victim")
+    assert acknowledgement == {"request_id": "victim", "cancelled": True,
+                               "active_request_ids_before_cancel": ["victim", "peer"]}
+    peer.close()
+    victim.step()
+    # The acknowledgement retains its own immutable list after peers terminate;
+    # terminal metadata describes the later boundary, not the old observation.
+    assert acknowledgement["active_request_ids_before_cancel"] == ["victim", "peer"]
+    ledger = model.stats()["terminal_requests"]
+    assert ledger[0]["active_peer_request_ids"] == ["victim"]
+    assert ledger[1]["active_peer_request_ids"] == []
+    assert model.cancel("unknown") is False
+    assert model.cancel_with_observation("unknown") == {
+        "request_id": "unknown", "cancelled": False, "active_request_ids_before_cancel": [],
+    }
+    assert_clean(model)
+
+
+def test_disconnect_terminal_records_peer_at_release_and_http_cancel_returns_snapshot():
+    with serving() as (model, address):
+        victim = model.submit([1], max_tokens=4, request_id="victim")
+        peer = model.submit([3], max_tokens=4, request_id="peer")
+        victim.step()
+        victim.close("disconnected")
+        terminal = model.stats()["terminal_requests"][-1]
+        assert terminal["finish_reason"] == "disconnected"
+        assert terminal["active_peer_request_ids"] == ["peer"]
+        connection, response = request(address, "/v1/cancel/peer")
+        assert response.status == 200
+        assert json.loads(response.read()) == {"request_id": "peer", "cancelled": True,
+                                               "active_request_ids_before_cancel": ["peer"]}
+        connection.close()
+        peer.step()
+        assert_clean(model)

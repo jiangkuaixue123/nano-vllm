@@ -69,6 +69,11 @@ failures return 400 before admission.
 
 `POST /v1/cancel/{request_id}` returns `{"request_id": "...", "cancelled": true}`
 for an active request, or 404 for an unknown/finished request. Cancellation is
+accompanied by `active_request_ids_before_cancel`, captured under the same lock
+as its acknowledgement. Terminal records contain `active_peer_request_ids` from
+the instant the request is removed, so isolation checks can distinguish current
+peers from historical overlap. The Python `cancel()` API still returns a boolean;
+`cancel_with_observation()` returns the HTTP observation object. Cancellation is
 observed before or after a model call. In-flight CUDA work cannot be preempted.
 Disconnects are checked again after waiting for model ownership, before allocating
 request state. Client write-side EOF is treated as disconnection. Each terminal

@@ -90,16 +90,23 @@ class DedicatedEngine:
         return request
 
     def cancel(self, request_id, reason="cancelled"):
+        return self.cancel_with_observation(request_id, reason)["cancelled"]
+
+    def cancel_with_observation(self, request_id, reason="cancelled"):
+        """Acknowledge cancellation with its atomic admission-state snapshot."""
         if reason not in {"cancelled", "disconnected", "shutdown"}:
             raise ValueError("unsupported cancellation reason")
         with self._registry_lock:
+            observation = {"request_id": request_id, "cancelled": False,
+                           "active_request_ids_before_cancel": list(self._active)}
             request = self._active.get(request_id)
             if request is None:
-                return False
+                return observation
             if not request.cancelled.is_set():
                 request.cancel_reason = reason
                 request.cancelled.set()
-            return True
+            observation["cancelled"] = True
+            return observation
 
     def _finish(self, request, reason):
         # Caller holds model lock; no socket I/O occurs while holding it.
@@ -113,10 +120,12 @@ class DedicatedEngine:
             if reason in {"stop", "length", "cancelled"} and request.cancelled.is_set():
                 reason = request.cancel_reason
             request.finish_reason = reason
+            peers = [request_id for request_id in self._active if request_id != request.request_id]
             self._active.pop(request.request_id, None)
             self._counts[reason] += 1
             self._terminal.append({"request_id": request.request_id, "finish_reason": reason,
-                                   "token_count": len(request.token_ids), "prefilled": request.started})
+                                   "token_count": len(request.token_ids), "prefilled": request.started,
+                                   "active_peer_request_ids": peers})
 
     def _refresh_ownership(self):
         # Model lock is held. Tensor metadata requires no device synchronization.
