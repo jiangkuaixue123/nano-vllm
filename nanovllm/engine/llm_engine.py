@@ -41,6 +41,8 @@ class LLMEngine:
             p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+        if sampling_params.temperature <= 1e-10:
+            raise ValueError("The legacy engine does not support greedy sampling")
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)

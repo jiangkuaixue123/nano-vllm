@@ -1,0 +1,21 @@
+The original nano-vllm implementation is Copyright (c) 2025 Xingkai Yu,
+distributed under the MIT license in LICENSE.
+
+The dedicated Qwen3.8 numerical model implementation is adapted from
+Transformers' Qwen3.5 implementation:
+Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
+Licensed under Apache License 2.0, reproduced in LICENSES/Apache-2.0.txt.
+https://github.com/huggingface/transformers/tree/v5.20.2/src/transformers/models/qwen3_5
+
+Modifications provide an inference-only text module, explicit request-owned
+hybrid state, strict target configuration and standalone weight loading.
+The runtime does not invoke Transformers model forward/generate methods.
+Transformers remains used for tokenization and as an independently executed
+test reference. Model weights retain their own upstream license.
+
+The dedicated FP8 Triton kernel adapts the blockwise E4M3 quantization and
+matrix multiplication from Hugging Face's finegrained-fp8 kernel, Apache-2.0:
+https://huggingface.co/kernels/kernels-community/finegrained-fp8/tree/0e5764aa5c27d0f005117a92645156481540950a/build/torch-cuda
+Modifications specialize dynamic activation quantization, fixed launch geometry
+and FP32 accumulation for the dedicated text engine; no Hub kernel download or
+Transformers model execution is required by the native runtime.
