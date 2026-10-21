@@ -1,4 +1,4 @@
-"""Strict single-device BF16 text loading for the dedicated Qwen3.8 path.
+"""Strict single-device BF16/block-FP8 loading for the dedicated text path.
 
 The campaign must authenticate model bytes against its immutable manifest before
 calling this loader. This module checks tensor coverage, ownership, shape and
@@ -57,8 +57,15 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError("Checkpoint index requires a nonempty weight map")
     parameters = dict(model.named_parameters())
-    if not parameters or any(p.dtype != torch.bfloat16 or p.is_meta for p in parameters.values()):
-        raise ValueError("Allocate all native parameters as BF16 before loading")
+    from .quant import FP8Linear, fp8_report
+
+    fp8_modules = {name: module for name, module in model.named_modules() if isinstance(module, FP8Linear)}
+    expected_dtypes = {name: (torch.bfloat16, "BF16") for name in parameters}
+    for name in fp8_modules:
+        expected_dtypes[name + ".weight"] = (torch.float8_e4m3fn, "F8_E4M3")
+        expected_dtypes[name + ".weight_scale_inv"] = (torch.float32, "BF16")
+    if not parameters or any(p.dtype != expected_dtypes[name][0] or p.is_meta for name, p in parameters.items()):
+        raise ValueError("Allocate native parameters with the BF16/FP8 dtype contract before loading")
     shards = defaultdict(dict)
     mapped = set()
     skipped = {"vision": 0, "mtp": 0}
@@ -87,18 +94,25 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
                 if name is None:
                     continue
                 tensor = shard.get_slice(key)
-                if tensor.get_dtype() != "BF16":
-                    raise ValueError("Text checkpoint tensors must be BF16")
+                if tensor.get_dtype() != expected_dtypes[name][1]:
+                    raise ValueError("Text checkpoint tensor dtype violates BF16/FP8 contract")
                 if tuple(tensor.get_shape()) != tuple(parameters[name].shape):
                     raise ValueError("Checkpoint tensor shape mismatch")
+                if name.endswith(".weight_scale_inv"):
+                    scale = shard.get_tensor(key).float()
+                    if not torch.all(torch.isfinite(scale) & (scale > 0)).item():
+                        raise ValueError("FP8 weight scales must be finite and positive")
     with torch.no_grad():
         for path, names in shards.items():
             with safe_open(path, framework="pt", device="cpu") as shard:
                 for key, name in names.items():
                     if name is not None:
                         parameters[name].copy_(shard.get_tensor(key))
-    return {"loaded_parameters": len(mapped), "excluded_tensors": skipped,
-            "scope": "text_only", "dtype": "bfloat16"}
+    report = {"loaded_parameters": len(mapped), "excluded_tensors": skipped,
+              "scope": "text_only", "dtype": "bfloat16"}
+    if fp8_modules:
+        report.update(fp8_report(len(fp8_modules)))
+    return report
 
 
 def load_checkpoint(model_path: str | Path, *, device: str = "cuda:0"):
@@ -115,6 +129,14 @@ def load_checkpoint(model_path: str | Path, *, device: str = "cuda:0"):
     config = Qwen38TextConfig.from_dict(raw, strict=True)
     with torch.device("meta"):
         model = Qwen38ForCausalLM(config).to(dtype=torch.bfloat16)
+        if config.weight_format == "fp8":
+            from .quant import convert_fp8_linears
+
+            if torch.cuda.get_device_capability(0) != (9, 0):
+                raise ValueError("Dedicated FP8 kernel requires SM90")
+            # Do not call model.to(dtype=...) after this: FP8 weights and FP32
+            # multipliers must retain their distinct representation.
+            convert_fp8_linears(model, config.modules_to_not_convert)
     model.to_empty(device=device)
     report = load_weights(model, root)
     model.eval()

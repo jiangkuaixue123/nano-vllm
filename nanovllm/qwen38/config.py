@@ -1,8 +1,12 @@
-"""Configuration boundary for the single supported, unquantized text model."""
+"""Configuration boundary for the dedicated BF16 and block-FP8 text paths."""
 
 from dataclasses import dataclass, fields
 
 MODEL_ID = "Qwen/Qwen3.8-27B"
+FP8_QUANTIZATION = {
+    "activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
+    "weight_block_size": [128, 128],
+}
 
 
 @dataclass(frozen=True)
@@ -28,9 +32,13 @@ class Qwen38TextConfig:
     max_position_embeddings: int = 262144
     eos_token_id: int = 248044
     bos_token_id: int = 248044
+    weight_format: str = "bfloat16"
+    modules_to_not_convert: tuple[str, ...] = ()
     _test_only: bool = False
 
     def __post_init__(self):
+        if self.weight_format not in {"bfloat16", "fp8"}:
+            raise ValueError("Unsupported weight format")
         for field in fields(self):
             value = getattr(self, field.name)
             if field.name in INTEGER_FIELDS and (type(value) is not int or value <= 0):
@@ -76,11 +84,21 @@ class Qwen38TextConfig:
         if (
             outer.get("model_type") != "qwen3_5"
             or outer.get("architectures") != ["Qwen3_5ForConditionalGeneration"]
-            or outer.get("quantization_config")
             or text.get("quantization_config")
             or outer.get("tie_word_embeddings") is not False
         ):
-            raise ValueError("Expected the unquantized Qwen3.8-27B checkpoint")
+            raise ValueError("Expected the supported Qwen3.8-27B checkpoint")
+        quant = outer.get("quantization_config")
+        quant_args = {}
+        if quant is not None:
+            if not isinstance(quant, dict) or set(quant) != set(FP8_QUANTIZATION) | {"modules_to_not_convert"}:
+                raise ValueError("Expected the dynamic block-FP8 quantization configuration")
+            if any(quant.get(key) != value for key, value in FP8_QUANTIZATION.items()):
+                raise ValueError("Unsupported FP8 quantization semantics")
+            excluded = quant["modules_to_not_convert"]
+            if not isinstance(excluded, list) or not excluded or any(not isinstance(x, str) or not x for x in excluded):
+                raise ValueError("FP8 requires explicit module exclusions")
+            quant_args = {"weight_format": "fp8", "modules_to_not_convert": tuple(excluded)}
         for name, expected in TEXT_SEMANTICS.items():
             if text.get(name) != expected:
                 raise ValueError("Unsupported text execution semantics")
@@ -97,7 +115,7 @@ class Qwen38TextConfig:
         }
         args["layer_types"] = tuple(args["layer_types"])
         args["rope_theta"] = rope["rope_theta"]
-        return cls(**args)
+        return cls(**args, **quant_args)
 
     @classmethod
     def for_testing(cls, **overrides):
@@ -146,7 +164,7 @@ INTEGER_FIELDS = {
 PRODUCTION_SIGNATURE = {
     field.name: (PRODUCTION_PATTERN if field.name == "layer_types" else field.default)
     for field in fields(Qwen38TextConfig)
-    if field.name != "_test_only"
+    if field.name not in {"_test_only", "weight_format", "modules_to_not_convert"}
 }
 TEXT_SEMANTICS = {
     "model_type": "qwen3_5_text",

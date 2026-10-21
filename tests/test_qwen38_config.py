@@ -4,7 +4,7 @@ from dataclasses import asdict
 
 import pytest
 
-from nanovllm.qwen38.config import TEXT_SEMANTICS, Qwen38TextConfig
+from nanovllm.qwen38.config import FP8_QUANTIZATION, TEXT_SEMANTICS, Qwen38TextConfig
 
 
 def production_config():
@@ -72,6 +72,25 @@ def test_tiny_factory_is_explicit_not_a_checkpoint_fallback():
         Qwen38TextConfig(hidden_size=16)
     with pytest.raises(ValueError, match="for_testing"):
         Qwen38TextConfig.from_dict(production_config(), strict=False)
+
+
+def test_dynamic_block_fp8_config():
+    raw = production_config()
+    raw["quantization_config"] = {**FP8_QUANTIZATION, "modules_to_not_convert": ["lm_head"]}
+    config = Qwen38TextConfig.from_dict(raw)
+    assert config.weight_format == "fp8"
+    assert config.modules_to_not_convert == ("lm_head",)
+
+
+@pytest.mark.parametrize("key,value", [
+    ("activation_scheme", "static"), ("weight_block_size", [64, 128]),
+    ("fmt", "e5m2"), ("dequantize", True), ("modules_to_not_convert", []),
+])
+def test_other_fp8_semantics_rejected(key, value):
+    raw = production_config()
+    raw["quantization_config"] = {**FP8_QUANTIZATION, "modules_to_not_convert": ["lm_head"], key: value}
+    with pytest.raises(ValueError):
+        Qwen38TextConfig.from_dict(raw)
 
 
 @pytest.mark.parametrize(
