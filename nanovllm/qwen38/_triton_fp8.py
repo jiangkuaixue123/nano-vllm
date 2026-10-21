@@ -26,7 +26,7 @@ def qwen38_block_fp8(A, B, S, C, M: tl.constexpr, N: tl.constexpr,
         scale_a = tl.max(tl.abs(raw), axis=1) / 448.0
         a = (raw / tl.maximum(scale_a[:, None], 1e-12)).to(tl.float8e4nv)
         b = tl.load(B + cols[None, :] * K + kk[:, None],
-                    (cols[None, :] < N) & (kk[:, None] < K), other=0)
+                    (cols[None, :] < N) & (kk[:, None] < K), other=0.0)
         scale_b = tl.load(S + (cols // 128) * tl.cdiv(K, 128) + block,
                           cols < N, other=0)
         acc += tl.dot(a, b) * scale_a[:, None] * scale_b[None, :]
