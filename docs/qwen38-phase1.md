@@ -19,13 +19,15 @@ correctness-first prototype; no performance gain is claimed.
   convolution and FP32 recurrent state. It does not call Transformers model
   `forward` or `generate`. The native path uses eager Torch operators and a
   dedicated Triton FP8 linear kernel.
-- One visible CUDA device, serial request execution and greedy
-  generation are supported by this prototype. Separate request state can be
-  interleaved through the runner; this is not vectorized continuous batching.
+- One visible CUDA device and greedy generation are supported. The public engine
+  serializes model calls while concurrent requests own independent states and
+  interleave token steps; this is not vectorized continuous batching.
 - Prefix sharing, paged KV integration, CUDA Graph, stochastic sampling, tensor
   parallelism, additional quantization formats, MTP and vision are not implemented in this path.
-  The original nano-vllm `LLM` still runs its original Qwen3 implementation;
-  use the explicit dedicated entry below for this prototype.
+  The public `LLM` entrypoint selects the dedicated path for this model;
+  unrelated configurations retain the original engine. See the
+  [engine and HTTP/SSE contract](qwen38-service.md) for supported parameters,
+  streaming, cancellation and shutdown behavior.
 - Weight loading requires complete text parameter coverage and explicit
   exclusion of vision/MTP tensors. A local index is not model authentication:
   the acceptance workflow first verifies every frozen file against immutable
@@ -87,6 +89,9 @@ comparisons, loader corruption checks and request lifecycle behavior. These
 checks cannot qualify the downloaded 27B checkpoint or establish GPU speed.
 Real model comparisons must retain the frozen workload, validator, exact source
 identities, runtime and complete InferRSI results.
+Phase 1 also requires real-model HTTP/SSE functional evidence for concurrent
+isolation, cancellation, disconnection, errors, shutdown and state/capacity reuse.
+CPU socket tests do not establish that service acceptance.
 
 The model math is derived from the Apache-2.0 Transformers Qwen3.5 source.
 See [NOTICE-qwen38](../NOTICE-qwen38) and [Apache license](../LICENSES/Apache-2.0.txt).

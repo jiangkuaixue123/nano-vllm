@@ -1,4 +1,4 @@
-"""Run the dedicated eager BF16 text prototype on one visible CUDA device."""
+"""Run the dedicated BF16/block-FP8 text prototype on one visible CUDA device."""
 
 import argparse
 import json

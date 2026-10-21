@@ -12,6 +12,8 @@ A lightweight vLLM implementation built from scratch.
 
 The experimental [Qwen3.8-27B dedicated text path](docs/qwen38-phase1.md)
 provides a separate native eager prototype and an InferRSI validation workflow.
+Its [public engine entrypoint and HTTP/SSE service](docs/qwen38-service.md)
+support bounded greedy generation and independent request lifetimes.
 Its real-model H20 qualification and performance optimization are pending.
 
 ## Key Features
