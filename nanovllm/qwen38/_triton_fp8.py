@@ -41,8 +41,12 @@ def matmul(inputs, weight, scales):
     output = torch.empty((*inputs.shape[:-1], n), device=inputs.device, dtype=torch.bfloat16)
     # A fixed launch, deliberately without candidate autotuning. The FP8 dot is
     # accumulated in FP32 per K128 block, then scaled in the reference order.
+    # SM90 native FP8 requires MMA v3, whose M tile is a multiple of 64.
+    # Smaller tiles select MMA v2 and Triton promotes both FP8 operands to FP16.
+    # Masked rows preserve the logical input/output shape even for one-token decode.
+    block_m = 64
     with torch.cuda.device(inputs.device):
-        last_compiled_kernel = qwen38_block_fp8[(triton.cdiv(m, 16), triton.cdiv(n, 128))](
-            inputs, weight, scales, output, m, n, k, 16, num_warps=4, num_stages=2,
+        last_compiled_kernel = qwen38_block_fp8[(triton.cdiv(m, block_m), triton.cdiv(n, 128))](
+            inputs, weight, scales, output, m, n, k, block_m, num_warps=4, num_stages=2,
         )
     return output
