@@ -50,7 +50,13 @@ def make_models(dtype, seed=7, **overrides):
         },
     )
     reference_config._attn_implementation = "eager"
-    reference = Qwen3_5ForCausalLM(reference_config).to(dtype=dtype).eval()
+    reference = Qwen3_5ForCausalLM(reference_config).eval()
+    # Match from_pretrained(dtype=...): weights use the selected dtype while
+    # computed rotary frequencies remain FP32. A whole-module .to(dtype) would
+    # also round inv_freq, creating an oracle that differs from checkpoint load.
+    with torch.no_grad():
+        for parameter in reference.parameters():
+            parameter.data = parameter.data.to(dtype=dtype)
     native = Qwen38ForCausalLM(tiny).to(dtype=dtype).eval()
     # A strict load proves the entire native parameter surface matches the oracle.
     native.load_state_dict(reference.state_dict(), strict=True)
@@ -239,3 +245,36 @@ def test_production_head_dimensions_and_ratios_with_adjacent_linear_layers(dtype
         assert attention.key.shape == attention.value.shape == (1, 1, position, 256)
         torch.testing.assert_close(attention.key, cache.layers[3].keys)
         torch.testing.assert_close(attention.value, cache.layers[3].values)
+
+
+def test_reference_factory_matches_pretrained_buffer_dtype(tmp_path):
+    """Guard the oracle itself against accidentally rounding rotary frequencies."""
+    _native, reference = make_models(
+        torch.bfloat16, head_dim=256, partial_rotary_factor=0.25
+    )
+    checkpoint = tmp_path / "synthetic-reference"
+    reference.save_pretrained(checkpoint)
+    loaded = Qwen3_5ForCausalLM.from_pretrained(
+        checkpoint,
+        dtype=torch.bfloat16,
+        local_files_only=True,
+        attn_implementation="eager",
+    ).eval()
+    assert reference.model.embed_tokens.weight.dtype == torch.bfloat16
+    assert loaded.model.embed_tokens.weight.dtype == torch.bfloat16
+    assert reference.model.rotary_emb.inv_freq.dtype == torch.float32
+    assert loaded.model.rotary_emb.inv_freq.dtype == torch.float32
+    torch.testing.assert_close(
+        reference.model.rotary_emb.inv_freq,
+        loaded.model.rotary_emb.inv_freq,
+        rtol=0,
+        atol=0,
+    )
+    ids = torch.tensor([[1, 2, 3]])
+    with torch.inference_mode():
+        torch.testing.assert_close(
+            reference(ids, use_cache=False).logits,
+            loaded(ids, use_cache=False).logits,
+            rtol=0,
+            atol=0,
+        )
