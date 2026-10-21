@@ -145,6 +145,10 @@ class DedicatedEngine:
     def provenance(self):
         origins = {}
         for name, module in tuple(sys.modules.items()):
+            if name == "__main__":
+                # `python -m ...server` executes the file as __main__, without
+                # inserting its canonical module name into sys.modules.
+                name = getattr(getattr(module, "__spec__", None), "name", name)
             if name == "nanovllm" or name.startswith("nanovllm."):
                 path = getattr(module, "__file__", None)
                 if path and Path(path).is_file():

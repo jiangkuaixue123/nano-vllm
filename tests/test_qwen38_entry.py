@@ -2,7 +2,7 @@
 
 import json
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -41,3 +41,17 @@ def test_greedy_sampling_is_explicit_and_unsupported_constructor_options_fail_ea
     assert SamplingParams(temperature=0).temperature == 0
     with pytest.raises(TypeError, match="unexpected keyword"):
         LLM(tmp_path, tensor_parallel_size=2)
+
+
+def test_module_entrypoint_origin_is_preserved_when_executed_as_main(monkeypatch):
+    from test_qwen38_service import engine as fake_engine
+
+    from nanovllm.qwen38 import server
+
+    main = ModuleType("__main__")
+    main.__file__ = server.__file__
+    main.__spec__ = SimpleNamespace(name="nanovllm.qwen38.server")
+    monkeypatch.setitem(sys.modules, "__main__", main)
+    monkeypatch.delitem(sys.modules, "nanovllm.qwen38.server", raising=False)
+    origins = fake_engine().provenance()["module_origins"]
+    assert origins["nanovllm.qwen38.server"]["path"] == server.__file__
