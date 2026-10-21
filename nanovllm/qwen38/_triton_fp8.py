@@ -15,10 +15,13 @@ last_compiled_kernel = None
 @triton.jit
 def qwen38_block_fp8(A, B, S, C, M: tl.constexpr, N: tl.constexpr,
                      K: tl.constexpr, BM: tl.constexpr):
-    rows = tl.program_id(0) * BM + tl.arange(0, BM)
+    physical_rows = tl.arange(0, BM)
+    rows = tl.program_id(0) * 2 + physical_rows // 32
+    lanes = physical_rows % 32
+    output_rows = tl.program_id(0) * 2 + tl.arange(0, 2)
     cols = tl.program_id(1) * 128 + tl.arange(0, 128)
     inner = tl.arange(0, 128)
-    acc = tl.zeros((BM, 128), tl.float32)
+    acc = tl.zeros((2, 128), tl.float32)
     for block in range(tl.cdiv(K, 128)):
         kk = block * 128 + inner
         raw = tl.load(A + rows[:, None] * K + kk[None, :],
@@ -29,18 +32,17 @@ def qwen38_block_fp8(A, B, S, C, M: tl.constexpr, N: tl.constexpr,
                     (cols[None, :] < N) & (kk[:, None] < K), other=0.0)
         scale_b = tl.load(S + (cols // 128) * tl.cdiv(K, 128) + block,
                           cols < N, other=0)
-        # Precision prototype: 32 passes retain one product per hardware K32
-        # segment, costing about 32x the MMA work. Each dot starts from zero;
-        # FP32 merges still round and do not guarantee reference agreement.
-        partial = tl.zeros((BM, 128), tl.float32)
-        for lane in range(32):
-            keep = (inner % 32) == lane
-            aa = tl.where(keep[None, :], a, 0.0).to(tl.float8e4nv)
-            bb = tl.where(keep[:, None], b, 0.0).to(tl.float8e4nv)
-            partial += tl.dot(aa, bb, max_num_imprecise_acc=32)
-        acc += partial * scale_a[:, None] * scale_b[None, :]
-    tl.store(C + rows[:, None] * N + cols[None, :], acc.to(tl.bfloat16),
-             (rows[:, None] < M) & (cols[None, :] < N))
+        # Pack 32 singleton lanes per logical row into the SM90 M64 tile.
+        # With finite B, masking A retains one product per hardware K32 segment.
+        # The FP32 lane reduction changes rounding order; speed is unmeasured.
+        keep = (inner[None, :] % 32) == lanes[:, None]
+        aa = tl.where(keep, a, 0.0).to(tl.float8e4nv)
+        packed = tl.dot(aa, b, max_num_imprecise_acc=32)
+        partial = tl.sum(tl.reshape(packed, (2, 32, 128)), axis=1)
+        logical_scale_a = tl.max(tl.reshape(scale_a, (2, 32)), axis=1)
+        acc += partial * logical_scale_a[:, None] * scale_b[None, :]
+    tl.store(C + output_rows[:, None] * N + cols[None, :], acc.to(tl.bfloat16),
+             (output_rows[:, None] < M) & (cols[None, :] < N))
 
 
 def matmul(inputs, weight, scales):
@@ -52,10 +54,10 @@ def matmul(inputs, weight, scales):
     # accumulated in FP32 per K128 block, then scaled in the reference order.
     # SM90 native FP8 requires MMA v3, whose M tile is a multiple of 64.
     # Smaller tiles select MMA v2 and Triton promotes both FP8 operands to FP16.
-    # Masked rows preserve the logical input/output shape even for one-token decode.
+    # Each physical tile holds two logical rows, with 32 singleton lanes per row.
     block_m = 64
     with torch.cuda.device(inputs.device):
-        last_compiled_kernel = qwen38_block_fp8[(triton.cdiv(m, block_m), triton.cdiv(n, 128))](
+        last_compiled_kernel = qwen38_block_fp8[(triton.cdiv(m, 2), triton.cdiv(n, 128))](
             inputs, weight, scales, output, m, n, k, block_m, num_warps=4, num_stages=2,
         )
     return output
