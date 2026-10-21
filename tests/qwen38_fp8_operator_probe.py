@@ -13,6 +13,7 @@ import math
 from pathlib import Path
 
 import torch
+from qwen38_fp8_probe_support import bind_reference_kernel, case_specs
 
 from nanovllm.qwen38.quant import FP8Linear
 
@@ -60,6 +61,7 @@ def compare(actual, expected, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kernel-revision", required=True)
+    parser.add_argument("--kernel-sha256", required=True)
     parser.add_argument("--rtol", type=float, required=True)
     parser.add_argument("--atol", type=float, required=True)
     parser.add_argument("--max-nrmse", type=float, required=True)
@@ -68,6 +70,8 @@ def main():
     args = parser.parse_args()
     if len(args.kernel_revision) != 40 or any(c not in "0123456789abcdef" for c in args.kernel_revision):
         parser.error("kernel revision must be an immutable lowercase SHA")
+    if len(args.kernel_sha256) != 64 or any(c not in "0123456789abcdef" for c in args.kernel_sha256):
+        parser.error("kernel SHA-256 must identify the prepared complete source build")
     if any(not math.isfinite(x) or x < 0 for x in (args.rtol, args.atol, args.max_nrmse)):
         parser.error("acceptance bars must be finite and nonnegative")
     if args.output.exists():
@@ -81,20 +85,21 @@ def main():
     from nanovllm.qwen38 import _triton_fp8
 
     reference = get_kernel("kernels-community/finegrained-fp8", revision=args.kernel_revision)
+    reference_fingerprint = bind_reference_kernel(reference, args.kernel_revision, args.kernel_sha256)
     reference_matmul = reference.matmul_2d
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
     records = []
     # Exact production K/N geometries and bounded tail/zero/amplitude probes.
-    specs = [(m, n, k, "random") for m in (1, 17) for n, k in (
-        (10240, 5120), (17408, 5120), (5120, 17408), (5120, 6144),
-    )] + [(3, 129, 257, "random"), (3, 256, 256, "zero"),
-         (3, 256, 256, "amplitudes")]
+    specs = case_specs()
     with torch.inference_mode():
-        for m, n, k, kind in specs:
+        for m, n, k, kind, scale_kind in specs:
             inputs = torch.randn(m, k, device="cuda", generator=generator).bfloat16()
             weight = (torch.randn(n, k, device="cuda", generator=generator) * 64).clamp(-448, 448).to(torch.float8_e4m3fn)
             scales = torch.exp2(torch.randint(-8, 1, ((n + 127) // 128, (k + 127) // 128),
                                              device="cuda", generator=generator).float()).bfloat16().float()
+            if scale_kind == "nonpower2_bf16":
+                mantissa = torch.randint(129, 256, scales.shape, device="cuda", generator=generator).float() / 128
+                scales = (scales * mantissa).bfloat16().float()
             if kind == "zero":
                 inputs.zero_()
             elif kind == "amplitudes":
@@ -112,11 +117,12 @@ def main():
             torch.cuda.synchronize()
             against_reference = compare(actual, expected, args)
             against_golden = compare(actual, oracle, args)
+            reference_against_golden = compare(expected, oracle, args)
             # The independent oracle has an external NRMSE bar; allclose is
             # recorded but not a gate because eager division can round inputs
             # differently at E4M3 half-ULP boundaries.
             golden_passed = against_golden["finite"] and against_golden["nrmse"] <= args.max_nrmse
-            records.append({"shape": [m, n, k], "kind": kind,
+            records.append({"shape": [m, n, k], "kind": kind, "scale_kind": scale_kind,
                             "inputs_sha256": digest(inputs), "weight_sha256": digest(weight),
                             "scales_sha256": digest(scales), "native_sha256": digest(actual),
                             "reference_sha256": digest(expected), "golden_sha256": digest(oracle),
@@ -124,13 +130,17 @@ def main():
                             "ptx_sha256": hashlib.sha256(ptx.encode()).hexdigest(),
                             "fp8_mma_signatures": mma_signatures,
                             "against_reference": against_reference, "against_golden": against_golden,
-                            "passed": against_reference["passed"] and golden_passed and bool(mma_signatures)})
+                            "reference_against_golden": reference_against_golden,
+                            "passed": against_reference["passed"] and golden_passed
+                                      and reference_against_golden["finite"] and bool(mma_signatures)})
 
     report = {"schema_version": 1, "scope": "operator_l0", "seed": args.seed,
               "kernel_revision": args.kernel_revision,
+              "reference_fingerprint": reference_fingerprint,
               "thresholds": {"rtol": args.rtol, "atol": args.atol, "max_nrmse": args.max_nrmse},
               "tf32": False, "device": torch.cuda.get_device_name(0), "torch": torch.__version__,
               "source_sha256": {"probe": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                                "probe_support": hashlib.sha256(Path(inspect.getfile(bind_reference_kernel)).read_bytes()).hexdigest(),
                                 "native_kernel": hashlib.sha256(Path(_triton_fp8.__file__).read_bytes()).hexdigest(),
                                 "reference_matmul": hashlib.sha256(Path(inspect.getfile(reference_matmul)).read_bytes()).hexdigest()},
               "cases": records, "passed": all(case["passed"] for case in records)}
