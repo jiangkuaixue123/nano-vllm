@@ -4,24 +4,26 @@ This path develops an independent Qwen3.8-27B text engine in the nano-vllm
 codebase. InferRSI coordinates experiments externally; the runtime does not
 import or require InferRSI. Governing scope and acceptance are recorded in
 [InferRSI task](https://github.com/InferMatrixLab/InferRSI/issues/53) and
-[phase-1 acceptance](https://github.com/InferMatrixLab/InferRSI/issues/54).
+[FP8 phase-1 acceptance](https://github.com/InferMatrixLab/InferRSI/issues/57).
 
-Status: **unverified; INCONCLUSIVE**. Real BF16 checkpoint, single-H20 numerical
+Status: **unverified; INCONCLUSIVE**. Real FP8 checkpoint, single-H20 numerical
 validation and end-to-end qualification are pending. The implementation is a
 correctness-first prototype; no performance gain is claimed.
 
 ## Execution boundary
 
-- Only the exact unquantized Qwen/Qwen3.8-27B text configuration is accepted by
-  the production loader. Tiny configurations are an explicit testing API.
+- The production loader accepts the exact Qwen/Qwen3.8-27B text configuration
+  and its official Qwen/Qwen3.8-27B-FP8 dynamic E4M3 block-128 profile.
+  Tiny configurations are an explicit testing API.
 - The dedicated model owns every decoder layer and its full-attention KV,
   convolution and FP32 recurrent state. It does not call Transformers model
-  `forward` or `generate`. The native path currently uses eager Torch operators.
-- One visible CUDA device, BF16 parameters, serial request execution and greedy
+  `forward` or `generate`. The native path uses eager Torch operators and a
+  dedicated Triton FP8 linear kernel.
+- One visible CUDA device, serial request execution and greedy
   generation are supported by this prototype. Separate request state can be
   interleaved through the runner; this is not vectorized continuous batching.
 - Prefix sharing, paged KV integration, CUDA Graph, stochastic sampling, tensor
-  parallelism, quantization, MTP and vision are not implemented in this path.
+  parallelism, additional quantization formats, MTP and vision are not implemented in this path.
   The original nano-vllm `LLM` still runs its original Qwen3 implementation;
   use the explicit dedicated entry below for this prototype.
 - Weight loading requires complete text parameter coverage and explicit
@@ -29,10 +31,19 @@ correctness-first prototype; no performance gain is claimed.
   the acceptance workflow first verifies every frozen file against immutable
   upstream identities.
 
+The FP8 path requires SM90. It retains E4M3 weights, quantizes activations
+dynamically per token and K128 group, and accumulates scaled products in FP32
+before BF16 output. Checkpoint BF16 scales are represented exactly as FP32.
+Excluded projections, embeddings, output head and normalization parameters
+retain BF16; recurrent state remains FP32. No dense weight-dequantization
+fallback is implemented. This describes the implementation, not verified GPU
+correctness or performance.
+
 ## Run from this checkout
 
 Prepare a Python 3.12 environment with CUDA-capable Torch, Transformers and
-Safetensors using the campaign's frozen dependency lock. Tiny reference tests
+Safetensors using the campaign's frozen dependency lock; FP8 also requires
+compatible Triton. Tiny reference tests
 also require pytest. The dedicated path does not import the legacy Flash
 Attention/Triton runner. After preparing the environment, from this checkout:
 

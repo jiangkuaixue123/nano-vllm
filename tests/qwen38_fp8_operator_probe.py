@@ -134,6 +134,8 @@ def main():
                             "passed": against_reference["passed"] and golden_passed
                                       and reference_against_golden["finite"] and bool(mma_signatures)})
 
+    if bind_reference_kernel(reference, args.kernel_revision, args.kernel_sha256) != reference_fingerprint:
+        raise RuntimeError("Reference kernel changed during the operator probe")
     report = {"schema_version": 1, "scope": "operator_l0", "seed": args.seed,
               "kernel_revision": args.kernel_revision,
               "reference_fingerprint": reference_fingerprint,
