@@ -29,10 +29,16 @@ def qwen38_block_fp8(A, B, S, C, M: tl.constexpr, N: tl.constexpr,
                     (cols[None, :] < N) & (kk[:, None] < K), other=0.0)
         scale_b = tl.load(S + (cols // 128) * tl.cdiv(K, 128) + block,
                           cols < N, other=0)
-        # Keep each SM90 FP8 MMA partial sum to K32, then combine in FP32.
-        # The default chains low-precision accumulation across K128; values
-        # below 32 would instead disable native FP8 MMA on SM90.
-        acc += tl.dot(a, b, max_num_imprecise_acc=32) * scale_a[:, None] * scale_b[None, :]
+        # Precision prototype: 32 passes retain one product per hardware K32
+        # segment, costing about 32x the MMA work. Each dot starts from zero;
+        # FP32 merges still round and do not guarantee reference agreement.
+        partial = tl.zeros((BM, 128), tl.float32)
+        for lane in range(32):
+            keep = (inner % 32) == lane
+            aa = tl.where(keep[None, :], a, 0.0).to(tl.float8e4nv)
+            bb = tl.where(keep[:, None], b, 0.0).to(tl.float8e4nv)
+            partial += tl.dot(aa, bb, max_num_imprecise_acc=32)
+        acc += partial * scale_a[:, None] * scale_b[None, :]
     tl.store(C + rows[:, None] * N + cols[None, :], acc.to(tl.bfloat16),
              (rows[:, None] < M) & (cols[None, :] < N))
 
