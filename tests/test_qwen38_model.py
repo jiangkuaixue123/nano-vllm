@@ -193,3 +193,49 @@ def test_native_execution_does_not_import_transformers():
             )
         elif isinstance(node, ast.ImportFrom):
             assert not (node.module or "").startswith("transformers")
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_production_head_dimensions_and_ratios_with_adjacent_linear_layers(dtype):
+    """Exercise production inner shapes without allocating 27B model weights."""
+    native, reference = make_models(
+        dtype,
+        seed=29,
+        num_attention_heads=6,
+        num_key_value_heads=1,
+        head_dim=256,
+        linear_num_key_heads=1,
+        linear_num_value_heads=3,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        partial_rotary_factor=0.25,
+        num_hidden_layers=4,
+        layer_types=("linear_attention",) * 3 + ("full_attention",),
+    )
+    ids = torch.randint(0, native.config.vocab_size, (1, 6))
+    with torch.inference_mode():
+        expected = reference(ids, use_cache=False).logits
+    assert_logits(native(ids), expected, dtype)
+
+    state, cache, position = native.new_state(), None, 0
+    for count in (2, 3, 1):
+        chunk = ids[:, position : position + count]
+        with torch.inference_mode():
+            output = reference(chunk, past_key_values=cache, use_cache=True)
+        cache = output.past_key_values
+        assert_logits(native(chunk, state=state), output.logits, dtype)
+        position += count
+        assert state.length == position
+        for index in range(3):
+            actual, oracle = state.layers[index], cache.layers[index]
+            assert actual.recurrent.shape == (1, 3, 128, 128)
+            assert actual.recurrent.dtype == torch.float32
+            assert actual.conv.shape == (1, 640, 4)
+            torch.testing.assert_close(
+                actual.recurrent, oracle.recurrent_states[0], rtol=1e-5, atol=1e-6
+            )
+            torch.testing.assert_close(actual.conv, oracle.conv_states[0])
+        attention = state.layers[3]
+        assert attention.key.shape == attention.value.shape == (1, 1, position, 256)
+        torch.testing.assert_close(attention.key, cache.layers[3].keys)
+        torch.testing.assert_close(attention.value, cache.layers[3].values)
