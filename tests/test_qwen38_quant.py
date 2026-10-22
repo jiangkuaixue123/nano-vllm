@@ -12,6 +12,21 @@ from nanovllm.qwen38.model import Qwen38ForCausalLM
 from nanovllm.qwen38.quant import FP8Linear, convert_fp8_linears
 
 
+@pytest.mark.parametrize("backend", ["flashinfer", "deepgemm", "typo"])
+def test_unimplemented_backend_is_not_silently_ignored(monkeypatch, backend):
+    monkeypatch.setenv("NANOVLLM_FP8_GEMM", backend)
+    with pytest.raises(ValueError, match="Unsupported NANOVLLM_FP8_GEMM"):
+        FP8Linear(128, 128, device="meta")
+
+
+@pytest.mark.parametrize("backend", ["triton", "triton_block_fp8"])
+def test_supported_backend_aliases_report_implemented_kernel(monkeypatch, backend):
+    monkeypatch.setenv("NANOVLLM_FP8_GEMM", backend)
+    module = FP8Linear(128, 128, device="meta")
+    assert module.backend == "triton_block_fp8"
+    assert module.kernel_name == "qwen38_block_fp8"
+
+
 def tiny_fp8_model():
     model = Qwen38ForCausalLM(Qwen38TextConfig.for_testing()).to(torch.bfloat16)
     exclusions = ("lm_head", "model.language_model.layers.0.linear_attn.in_proj_a",
