@@ -49,6 +49,34 @@ class HybridState:
     _owner: object = field(default=None, repr=False)
 
 
+class FusedProjection(nn.Module):
+    """把共享输入维的多个投影合成一份权重：(sum(out_i), in)。
+
+    只保留一份参数，原 nn.Linear 在 fuse 时被删除（不是并存），避免多占权重显存。
+    forward 一次 matmul 后按输出维切分，kernel 数由 3 降到 1。
+    """
+
+    def __init__(self, in_features, out_sizes, names, *, device=None, dtype=None):
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_sizes = tuple(int(x) for x in out_sizes)
+        self.names = tuple(names)
+        assert len(self.names) == len(self.out_sizes)
+        self.weight = nn.Parameter(
+            torch.empty(sum(self.out_sizes), self.in_features, device=device, dtype=dtype)
+        )
+
+    def part_ranges(self):
+        out, ranges = 0, {}
+        for name, size in zip(self.names, self.out_sizes):
+            ranges[name] = (out, out + size)
+            out += size
+        return ranges
+
+    def forward(self, x):
+        return F.linear(x, self.weight).split(self.out_sizes, dim=-1)
+
+
 class RMSNorm(nn.Module):
     """Qwen zero-centered weights; preserve the FP32 multiplication order."""
 
@@ -135,13 +163,15 @@ class FullAttention(nn.Module):
         config = self.config
         count = x.shape[1]
         # Q and gate are interleaved per head, not two contiguous projection halves.
-        q, gate = self.q_proj(x).view(1, count, -1, config.head_dim * 2).chunk(2, -1)
+        if hasattr(self, "qkv_proj"):
+            q_lin, k_lin, v_lin = self.qkv_proj(x)
+        else:
+            q_lin, k_lin, v_lin = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        q, gate = q_lin.view(1, count, -1, config.head_dim * 2).chunk(2, -1)
         gate = gate.reshape(1, count, -1)
         q = self.q_norm(q).transpose(1, 2)
-        k = self.k_norm(self.k_proj(x).view(1, count, -1, config.head_dim)).transpose(
-            1, 2
-        )
-        v = self.v_proj(x).view(1, count, -1, config.head_dim).transpose(1, 2)
+        k = self.k_norm(k_lin.view(1, count, -1, config.head_dim)).transpose(1, 2)
+        v = v_lin.view(1, count, -1, config.head_dim).transpose(1, 2)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         if state.capacity:
             index = positions.reshape(-1)
@@ -305,12 +335,15 @@ class DeltaNet(nn.Module):
 
     def forward(self, x, state):
         config, count = self.config, x.shape[1]
-        raw = self.in_proj_qkv(x).transpose(1, 2)
-        gate = self.in_proj_z(x).reshape(1, count, -1, config.linear_value_head_dim)
-        beta = self.in_proj_b(x).sigmoid()
-        decay = -self.A_log.float().exp() * F.softplus(
-            self.in_proj_a(x).float() + self.dt_bias
-        )
+        if hasattr(self, "in_proj_fused"):
+            qkv_lin, z_lin, b_lin, a_lin = self.in_proj_fused(x)
+        else:
+            qkv_lin, z_lin = self.in_proj_qkv(x), self.in_proj_z(x)
+            b_lin, a_lin = self.in_proj_b(x), self.in_proj_a(x)
+        raw = qkv_lin.transpose(1, 2)
+        gate = z_lin.reshape(1, count, -1, config.linear_value_head_dim)
+        beta = b_lin.sigmoid()
+        decay = -self.A_log.float().exp() * F.softplus(a_lin.float() + self.dt_bias)
         buffered = state.capacity > 0 and state.conv is not None
         previous = state.conv is not None and not state.fresh
         mixed = torch.cat((state.conv, raw), dim=-1) if previous else raw
@@ -363,8 +396,23 @@ class MLP(nn.Module):
             config.intermediate_size, config.hidden_size, bias=False
         )
 
+    def _fuse(self):
+        fused = FusedProjection(
+            self.gate_proj.in_features,
+            (self.gate_proj.weight.shape[0], self.up_proj.weight.shape[0]),
+            ("gate_proj", "up_proj"),
+            device=self.gate_proj.weight.device, dtype=self.gate_proj.weight.dtype,
+        )
+        del self.gate_proj, self.up_proj
+        self.gate_up_proj = fused
+        return fused
+
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        if hasattr(self, "gate_up_proj"):
+            gate, up = self.gate_up_proj(x)
+        else:
+            gate, up = self.gate_proj(x), self.up_proj(x)
+        return self.down_proj(F.silu(gate) * up)
 
 
 class DecoderLayer(nn.Module):
@@ -407,6 +455,38 @@ class Qwen38ForCausalLM(nn.Module):
         self.model = TextModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self._state_owner = object()
+
+    def fuse_projections(self):
+        """BF16 路径把 q/k/v、in_proj_*、gate/up 各合成一份权重（删除原 Linear）。"""
+        count = 0
+        for module in self.modules():
+            if isinstance(module, MLP):
+                module._fuse()
+                count += 1
+            elif isinstance(module, FullAttention):
+                fused = FusedProjection(
+                    module.q_proj.in_features,
+                    (module.q_proj.weight.shape[0], module.k_proj.weight.shape[0],
+                     module.v_proj.weight.shape[0]),
+                    ("q_proj", "k_proj", "v_proj"),
+                    device=module.q_proj.weight.device, dtype=module.q_proj.weight.dtype,
+                )
+                del module.q_proj, module.k_proj, module.v_proj
+                module.qkv_proj = fused
+                count += 1
+            elif isinstance(module, DeltaNet):
+                fused = FusedProjection(
+                    module.in_proj_qkv.in_features,
+                    (module.in_proj_qkv.weight.shape[0], module.in_proj_z.weight.shape[0],
+                     module.in_proj_b.weight.shape[0], module.in_proj_a.weight.shape[0]),
+                    ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"),
+                    device=module.in_proj_qkv.weight.device,
+                    dtype=module.in_proj_qkv.weight.dtype,
+                )
+                del module.in_proj_qkv, module.in_proj_z, module.in_proj_b, module.in_proj_a
+                module.in_proj_fused = fused
+                count += 1
+        return count
 
     def new_state(self, capacity: int | None = None) -> HybridState:
         layers = [LayerState() for _ in self.config.layer_types]

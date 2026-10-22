@@ -56,7 +56,22 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError("Checkpoint index requires a nonempty weight map")
+    from .model import FusedProjection
+
     parameters = dict(model.named_parameters())
+    # 融合后的投影只有一份权重：把 checkpoint 里的 q_proj/k_proj/v_proj 等
+    # 映射到这份权重的行切片视图上，加载时直接原地写入，不额外占显存。
+    fused = [(name, module) for name, module in model.named_modules()
+             if isinstance(module, FusedProjection)]
+    for name, _module in fused:
+        parameters.pop(name + ".weight", None)
+    for name, module in fused:
+        # 融合模块挂在 <parent>.qkv_proj / .in_proj_fused / .gate_up_proj 下，
+        # 而 checkpoint 里是 <parent>.q_proj.weight 这种原始名，所以要去掉这一段。
+        parent = name.rpartition(".")[0]
+        weight = module.weight
+        for part, (start, end) in module.part_ranges().items():
+            parameters[f"{parent}.{part}.weight"] = weight[start:end]
     from .quant import FP8Linear, fp8_report
 
     fp8_modules = {name: module for name, module in model.named_modules() if isinstance(module, FP8Linear)}
@@ -137,6 +152,9 @@ def load_checkpoint(model_path: str | Path, *, device: str = "cuda:0"):
             # Do not call model.to(dtype=...) after this: FP8 weights and FP32
             # multipliers must retain their distinct representation.
             convert_fp8_linears(model, config.modules_to_not_convert)
+        else:
+            # BF16 路径才融合投影；FP8Linear 带 block scale，合并需要重排 scale，本轮不做。
+            model.fuse_projections()
     model.to_empty(device=device)
     report = load_weights(model, root)
     model.eval()
