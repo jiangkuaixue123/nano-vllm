@@ -32,16 +32,20 @@ from .config import Qwen38TextConfig
 
 @dataclass
 class LayerState:
+    capacity: int = 0
     key: torch.Tensor | None = None
     value: torch.Tensor | None = None
     conv: torch.Tensor | None = None
     recurrent: torch.Tensor | None = None
+    fresh: bool = True          # True 表示该请求还没写过卷积/递推态
 
 
 @dataclass
 class HybridState:
     layers: list[LayerState]
     length: int = 0
+    capacity: int = 0            # >0 表示 KV 预分配、原地写（CUDA Graph 解码用）
+    positions: torch.Tensor | None = None   # 设备端位置缓冲（capacity>0 时使用）
     _owner: object = field(default=None, repr=False)
 
 
@@ -53,11 +57,16 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(size))
         self.eps = eps
 
+    def _fused_weight(self, dtype):
+        # 零中心权重 1+w 只算一次，并按目标 dtype 缓存；推理期权重不变。
+        cached = getattr(self, "_fused", None)
+        if cached is None or cached.dtype is not dtype:
+            cached = (1.0 + self.weight.detach().float()).to(dtype)
+            object.__setattr__(self, "_fused", cached)
+        return cached
+
     def forward(self, x):
-        normalized = x.float() * torch.rsqrt(
-            x.float().pow(2).mean(-1, keepdim=True) + self.eps
-        )
-        return (normalized * (1.0 + self.weight.float())).to(x.dtype)
+        return F.rms_norm(x, (x.shape[-1],), self._fused_weight(x.dtype), self.eps)
 
 
 class GatedRMSNorm(nn.Module):
@@ -66,12 +75,15 @@ class GatedRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(size))
         self.eps = eps
 
+    def _fused_weight(self, dtype):
+        cached = getattr(self, "_fused", None)
+        if cached is None or cached.dtype is not dtype:
+            cached = self.weight.detach().to(dtype)
+            object.__setattr__(self, "_fused", cached)
+        return cached
+
     def forward(self, x, gate):
-        normalized = x.float() * torch.rsqrt(
-            x.float().pow(2).mean(-1, keepdim=True) + self.eps
-        )
-        weighted = self.weight * normalized.to(x.dtype)
-        return (weighted * F.silu(gate.float())).to(x.dtype)
+        return F.rms_norm(x, (x.shape[-1],), self._fused_weight(x.dtype), self.eps) * F.silu(gate)
 
 
 def rotary_tables(config, positions, dtype):
@@ -123,20 +135,47 @@ class FullAttention(nn.Module):
         )
         v = self.v_proj(x).view(1, count, -1, config.head_dim).transpose(1, 2)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-        if state.key is not None:
-            k = torch.cat((state.key, k), dim=2)
-            v = torch.cat((state.value, v), dim=2)
-        state.key, state.value = k, v
-        repeats = config.num_attention_heads // config.num_key_value_heads
-        keys, values = k.repeat_interleave(repeats, 1), v.repeat_interleave(repeats, 1)
-        scores = (q @ keys.transpose(-1, -2)) * config.head_dim**-0.5
-        allowed = torch.arange(k.shape[2], device=x.device).unsqueeze(
-            0
-        ) <= positions.unsqueeze(1)
-        scores = scores.masked_fill(~allowed[None, None], torch.finfo(q.dtype).min)
+        if state.capacity:
+            index = positions.reshape(-1)
+            state.key.index_copy_(2, index, k)
+            state.value.index_copy_(2, index, v)
+        else:
+            if state.key is not None:
+                k = torch.cat((state.key, k), dim=2)
+                v = torch.cat((state.value, v), dim=2)
+            state.key, state.value = k, v
+        kv_heads = config.num_key_value_heads
+        repeats = config.num_attention_heads // kv_heads
+        # 分组 bmm，且**不做 broadcast**：q 按 (kv_head, repeat*count) 压成 batch=kv_heads，
+        # KV 只转置不展开。写成 [1,4,6,count,d] @ [1,4,1,d,T] 会让 PyTorch 把 KV 的
+        # repeat 维物化（实测 8K 单步 8.7ms / 16 层，形状 1x4x6x256x8195），这正是那
+        # 14ms 非 GEMM 里最大的一块。改为 batch=4 的等形 bmm 后不再产生该拷贝。
+        q_grouped = q.reshape(kv_heads, repeats * count, config.head_dim)
+        keys, values = (
+            (state.key, state.value) if state.capacity else (k, v)
+        )
+        keys_bt = keys.reshape(kv_heads, -1, config.head_dim).transpose(1, 2)
+        scores = torch.matmul(q_grouped, keys_bt).reshape(
+            1, kv_heads, repeats, count, keys.shape[2]
+        ) * config.head_dim**-0.5
+        if state.capacity or count > 1:
+            # decode 单 token 时所有 key 都有效，mask 只在 prefill 建。
+            allowed = torch.arange(keys.shape[2], device=x.device).unsqueeze(
+                0
+            ) <= positions.unsqueeze(1)
+            scores = scores.masked_fill(
+                ~allowed[None, None, None], torch.finfo(q.dtype).min
+            )
         probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+        grouped = torch.matmul(
+            probabilities.reshape(kv_heads, repeats * count, keys.shape[2]),
+            values.reshape(kv_heads, -1, config.head_dim),
+        ).reshape(1, kv_heads, repeats, count, config.head_dim)
         result = (
-            (probabilities @ values).transpose(1, 2).contiguous().reshape(1, count, -1)
+            grouped.reshape(1, config.num_attention_heads, count, config.head_dim)
+            .transpose(1, 2)
+            .contiguous()
+            .reshape(1, count, -1)
         )
         # The inspected reference uses sigmoid here; its output_gate_type
         # checkpoint field does not select an alternative activation.
@@ -264,12 +303,15 @@ class DeltaNet(nn.Module):
         decay = -self.A_log.float().exp() * F.softplus(
             self.in_proj_a(x).float() + self.dt_bias
         )
-        previous = state.conv is not None
+        buffered = state.capacity > 0 and state.conv is not None
+        previous = state.conv is not None and not state.fresh
         mixed = torch.cat((state.conv, raw), dim=-1) if previous else raw
         kernel = config.linear_conv_kernel_dim
-        state.conv = F.pad(mixed, (max(0, kernel - mixed.shape[-1]), 0))[
-            :, :, -kernel:
-        ].clone()
+        window = F.pad(mixed, (max(0, kernel - mixed.shape[-1]), 0))[:, :, -kernel:]
+        if buffered:
+            state.conv.copy_(window)
+        else:
+            state.conv = window.clone()
         padding = 0 if previous and count == 1 else kernel - 1
         convolved = F.conv1d(
             mixed, self.conv1d.weight, groups=mixed.shape[1], padding=padding
@@ -289,9 +331,13 @@ class DeltaNet(nn.Module):
             key.repeat_interleave(repeats, 2),
         )
         operation = recurrent_delta if previous and count == 1 else chunk_delta
-        output, state.recurrent = operation(
-            query, key, value, decay, beta, state.recurrent
-        )
+        current = None if state.fresh else state.recurrent
+        output, updated = operation(query, key, value, decay, beta, current)
+        if buffered:
+            state.recurrent.copy_(updated)
+        else:
+            state.recurrent = updated
+        state.fresh = False
         output = self.norm(output, gate).reshape(1, count, self.value_dim)
         return self.out_proj(output)
 
@@ -354,10 +400,34 @@ class Qwen38ForCausalLM(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self._state_owner = object()
 
-    def new_state(self) -> HybridState:
-        return HybridState(
-            [LayerState() for _ in self.config.layer_types], _owner=self._state_owner
-        )
+    def new_state(self, capacity: int | None = None) -> HybridState:
+        layers = [LayerState() for _ in self.config.layer_types]
+        if capacity:
+            kv = self.config.num_key_value_heads
+            hd = self.config.head_dim
+            dtype = self.model.embed_tokens.weight.dtype
+            device = self.model.embed_tokens.weight.device
+            for layer, kind in zip(layers, self.config.layer_types):
+                layer.capacity = capacity
+                if kind == "full_attention":
+                    layer.key = torch.zeros(1, kv, capacity, hd, dtype=dtype, device=device)
+                    layer.value = torch.zeros(1, kv, capacity, hd, dtype=dtype, device=device)
+                else:
+                    # CUDA Graph 抓的是固定地址：卷积窗与递推态必须原地写，否则图内每步
+                    # 都读到 capture 时那一份，DeltaNet 的状态永远不累积。
+                    key_dim = self.config.linear_num_key_heads * self.config.linear_key_head_dim
+                    value_dim = (self.config.linear_num_value_heads
+                                 * self.config.linear_value_head_dim)
+                    layer.conv = torch.zeros(
+                        1, 2 * key_dim + value_dim, self.config.linear_conv_kernel_dim,
+                        dtype=dtype, device=device,
+                    )
+                    layer.recurrent = torch.zeros(
+                        1, self.config.linear_num_value_heads,
+                        self.config.linear_key_head_dim, self.config.linear_value_head_dim,
+                        dtype=torch.float32, device=device,
+                    )
+        return HybridState(layers, capacity=capacity or 0, _owner=self._state_owner)
 
     @torch.inference_mode()
     def forward(
@@ -372,7 +442,7 @@ class Qwen38ForCausalLM(nn.Module):
             raise ValueError("Expected nonempty int64 token IDs with shape [1, tokens]")
         if input_ids.device != self.model.embed_tokens.weight.device:
             raise ValueError("Token IDs and model must be on the same device")
-        if (
+        if (state is None or (state.length == 0 and state.positions is None)) and (
             input_ids.min().item() < 0
             or input_ids.max().item() >= self.config.vocab_size
         ):
@@ -387,19 +457,26 @@ class Qwen38ForCausalLM(nn.Module):
         if type(state.length) is not int or state.length < 0:
             raise ValueError("Invalid state position")
         end = state.length + input_ids.shape[1]
-        if end > self.config.max_position_embeddings:
+        if state.positions is None and end > self.config.max_position_embeddings:
             raise ValueError("Context exceeds model position limit")
         # Stage updates transactionally; functions never mutate old tensor storage.
         pending = [
-            LayerState(layer.key, layer.value, layer.conv, layer.recurrent)
+            LayerState(capacity=layer.capacity, key=layer.key, value=layer.value,
+                       conv=layer.conv, recurrent=layer.recurrent, fresh=layer.fresh)
             for layer in state.layers
         ]
         hidden = self.model.embed_tokens(input_ids)
-        positions = torch.arange(state.length, end, device=input_ids.device)
+        positions = (
+            state.positions
+            if state.positions is not None
+            else torch.arange(state.length, end, device=input_ids.device)
+        )
         cos, sin = rotary_tables(self.config, positions, hidden.dtype)
         cos, sin = cos[None, None], sin[None, None]
         for layer, layer_state in zip(self.model.layers, pending):
             hidden = layer(hidden, layer_state, positions, cos, sin)
         logits = self.lm_head(self.model.norm(hidden))
-        state.layers, state.length = pending, end
+        state.layers = pending
+        if state.positions is None:
+            state.length = end
         return logits
