@@ -434,8 +434,17 @@ class DecoderLayer(nn.Module):
             if self.kind == "linear_attention"
             else self.self_attn(normalized, state, positions, cos, sin)
         )
-        x = x + mixed
-        return x + self.mlp(self.post_attention_layernorm(x))
+        # 残差相加与 post-attention norm 折成一个 kernel：x ← x + mixed（原地），
+        # 同时产出归一化结果，少一次物化。数值语义与分开写相同。
+        norm = self.post_attention_layernorm
+        if x.is_cuda and x.dtype == torch.bfloat16 and x.shape[-1] == norm.weight.shape[0]:
+            from ._triton_rms import fused_add_rms
+
+            x, normed = fused_add_rms(x, mixed, norm._fused_weight(x.dtype), norm.eps)
+        else:
+            x = x + mixed
+            normed = norm(x)
+        return x + self.mlp(normed)
 
 
 class TextModel(nn.Module):
