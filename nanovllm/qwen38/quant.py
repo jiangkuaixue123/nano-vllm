@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 
@@ -21,6 +23,12 @@ class FP8Linear(nn.Module):
 
     def __init__(self, in_features: int, out_features: int, *, device=None):
         super().__init__()
+        requested = os.environ.get("NANOVLLM_FP8_GEMM", "triton")
+        if requested not in ("triton", self.backend):
+            raise ValueError(
+                f"Unsupported NANOVLLM_FP8_GEMM={requested!r}; this build implements "
+                f"only {self.backend}. No fallback was selected."
+            )
         if in_features <= 0 or out_features <= 0:
             raise ValueError("FP8 linear dimensions must be positive")
         self.in_features = in_features

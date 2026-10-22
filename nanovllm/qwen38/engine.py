@@ -181,6 +181,9 @@ class DedicatedEngine:
                        if isinstance(module, FP8Linear)}
             calls = {name: module.native_fp8_calls for name, module in modules.items()}
             execution = {"fp8_execution": {"modules": len(calls), "total_calls": sum(calls.values()),
+                         "call_counter_scope": "python_forward_only_includes_warmup_and_capture_excludes_graph_replay",
+                         "backend": self.loader_report["backend"],
+                         "kernel_name": self.loader_report["kernel_name"],
                          "executed_modules": sum(count > 0 for count in calls.values()), "per_module_calls": calls,
                          "weight_dtype": "float8_e4m3fn", "scale_dtype": "float32",
                          "actual_dtypes_valid": all(module.weight.dtype == torch.float8_e4m3fn
