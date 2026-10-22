@@ -23,7 +23,7 @@ The dedicated constructor accepts `max_context_tokens` and
 `max_active_requests`. Legacy constructor options are not aliases for these
 limits. Generation accepts text or token-list prompts and greedy sampling only.
 Each result contains `text`, `token_ids`, and `finish_reason` (`stop` or `length`).
-`ignore_eos=True` is available through the Python API. Stochastic sampling and
+`ignore_eos=True` is available through the Python and HTTP APIs. Stochastic sampling and
 unsupported constructor or HTTP fields fail explicitly. The unrelated legacy
 engine continues to require positive sampling temperature.
 
@@ -56,12 +56,23 @@ One HTTP request is served per connection; chunked request bodies are unsupporte
 | `temperature` | Optional; only zero is supported |
 | `stream` | Optional boolean, default false |
 | `request_id` | Optional identifier using letters, digits, `_`, `.`, `:`, `-` |
+| `ignore_eos` | Optional boolean, default false; true generates through EOS up to the requested cap |
+| `return_token_ids` | Optional boolean; true also echoes exact prompt IDs in the first stream choice or non-stream response |
+| `repetition_penalty` | Optional; only the neutral value 1.0 is supported |
+| `logprobs` | Optional; only null is supported |
+| `stream_options` | Streaming only; supports boolean `include_usage`, default false |
 
 Non-streaming JSON contains `choices[0].text`, `token_ids`, `finish_reason`, and
 token usage. Streaming responses use `text/event-stream`: each `data:` JSON chunk
 contains the request ID and a choice with cumulative-decoding text delta and new
-token IDs. The terminal choice has empty text/token IDs and a finish reason,
-followed by `data: [DONE]`. Normal termination uses `stop` or `length`;
+token IDs. Existing generated `token_ids` remain present regardless of the new
+prompt-echo flag. Normal termination puts its finish reason on the final token
+choice, without an additional empty choice that a benchmark could time as a
+token. A cancellation with no pending delta uses an empty terminal choice.
+With `include_usage=true`, choice chunks carry null usage and one final chunk
+has empty `choices` and actual prompt/completion/total token counts. Prompt IDs
+are echoed only once. The stream ends with `data: [DONE]`.
+Normal termination uses `stop` or `length`;
 explicit cancellation uses `cancelled`; service drain uses `shutdown`. Runtime
 errors emit a sanitized error object and terminal `error` framing when the
 connection is still writable. HTTP runtime failures return 500. Validation

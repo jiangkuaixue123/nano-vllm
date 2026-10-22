@@ -188,6 +188,68 @@ def test_eos_empty_completion_text_and_normal_cleanup():
         assert_clean(model)
 
 
+@pytest.mark.parametrize("ignore_eos, expected_count, reason", [(False, 1, "stop"), (True, 4, "length")])
+def test_benchmark_stream_counts_real_tokens_and_emits_one_choice_per_token(ignore_eos, expected_count, reason):
+    with serving(engine(eos=(1,))) as (model, address):
+        connection, response = stream(address, ignore_eos=ignore_eos, return_token_ids=True,
+                                      repetition_penalty=1.0, logprobs=None,
+                                      stream_options={"include_usage": True})
+        chunks = events(response)
+        connection.close()
+        choices = [chunk["choices"][0] for chunk in chunks if chunk["choices"]]
+        ids = [token for choice in choices for token in choice["token_ids"]]
+        assert len(ids) == len(choices) == expected_count
+        assert choices[0]["prompt_token_ids"] == [1]
+        assert all("prompt_token_ids" not in choice for choice in choices[1:])
+        assert all(choice["finish_reason"] is None for choice in choices[:-1])
+        assert choices[-1]["finish_reason"] == reason
+        assert all(chunk["usage"] is None for chunk in chunks[:-1])
+        assert chunks[-1]["choices"] == []
+        assert chunks[-1]["usage"] == {"prompt_tokens": 1, "completion_tokens": expected_count,
+                                       "total_tokens": 1 + expected_count}
+        assert_clean(model)
+
+
+def test_nonstream_token_echo_and_usage_use_actual_input_and_output():
+    with serving(engine(eos=(1,))) as (model, address):
+        status, result = complete(address, ignore_eos=True, return_token_ids=True)
+        assert status == 200
+        assert result["choices"][0]["prompt_token_ids"] == [1]
+        assert len(result["choices"][0]["token_ids"]) == 4
+        assert result["usage"] == {"prompt_tokens": 1, "completion_tokens": 4, "total_tokens": 5}
+        assert_clean(model)
+
+
+@pytest.mark.parametrize("options", [{}, {"include_usage": False}])
+def test_optional_usage_is_absent_when_disabled(options):
+    with serving() as (model, address):
+        connection, response = stream(address, return_token_ids=False, stream_options=options)
+        chunks = events(response)
+        connection.close()
+        assert len(chunks) == 4
+        assert all("usage" not in chunk for chunk in chunks)
+        assert all("prompt_token_ids" not in chunk["choices"][0] for chunk in chunks)
+        assert_clean(model)
+
+
+@pytest.mark.parametrize("fields", [
+    {"ignore_eos": 1}, {"return_token_ids": "true"},
+    {"repetition_penalty": True}, {"repetition_penalty": 1.1}, {"logprobs": 0},
+    {"stream_options": None}, {"stream_options": {"include_usage": 1}},
+    {"stream_options": {"continuous_usage_stats": True}},
+    {"stream": False, "stream_options": {"include_usage": True}},
+])
+def test_invalid_benchmark_options_rejected_before_model_work(fields):
+    with serving() as (model, address):
+        connection, response = request(address, body={"input_ids": [1], "max_tokens": 4,
+                                                     "stream": True, **fields})
+        assert response.status == 400
+        response.read()
+        connection.close()
+        assert not model.runner.model.calls
+        assert_clean(model)
+
+
 def test_concurrent_requests_match_serial_and_are_isolated():
     with serving() as (model, address):
         baseline = model.generate([[1], [3]], SamplingParams(temperature=0, max_tokens=4))

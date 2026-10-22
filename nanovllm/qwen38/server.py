@@ -163,14 +163,29 @@ class CompletionHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _chunk(self, request, text, token_ids, finish_reason=None):
-        return {"id": request.request_id, "request_id": request.request_id,
-                "object": "text_completion", "model": self.server.engine.model_id,
-                "choices": [{"index": 0, "text": text, "token_ids": token_ids,
-                             "finish_reason": finish_reason}]}
+        chunk = {"id": request.request_id, "request_id": request.request_id,
+                 "object": "text_completion", "model": self.server.engine.model_id,
+                 "choices": [{"index": 0, "text": text, "token_ids": token_ids,
+                              "finish_reason": finish_reason}]}
+        if self._include_usage:
+            chunk["usage"] = None
+        if self._prompt_token_ids is not None:
+            chunk["choices"][0]["prompt_token_ids"] = self._prompt_token_ids
+            self._prompt_token_ids = None
+        return chunk
+
+    @staticmethod
+    def _usage(request):
+        return {"prompt_tokens": len(request.prompt_ids),
+                "completion_tokens": len(request.token_ids),
+                "total_tokens": len(request.prompt_ids) + len(request.token_ids)}
 
     def do_POST(self):
         request = None
         streaming = False
+        self._include_usage = False
+        self._prompt_token_ids = None
+        terminal_sent = False
         headers_sent = False
         try:
             if self.path.startswith("/v1/cancel/"):
@@ -182,7 +197,8 @@ class CompletionHandler(BaseHTTPRequestHandler):
                 self._error(404, "unknown route")
                 return
             body = self._body()
-            allowed = {"model", "prompt", "input_ids", "max_tokens", "temperature", "stream", "request_id"}
+            allowed = {"model", "prompt", "input_ids", "max_tokens", "temperature", "stream", "request_id",
+                       "repetition_penalty", "logprobs", "stream_options", "ignore_eos", "return_token_ids"}
             if set(body) - allowed:
                 raise ValueError("unsupported completion fields")
             if body.get("model", self.server.engine.model_id) != self.server.engine.model_id:
@@ -194,12 +210,33 @@ class CompletionHandler(BaseHTTPRequestHandler):
             streaming = body.get("stream", False)
             if type(streaming) is not bool:
                 raise ValueError("stream must be boolean")
+            repetition_penalty = body.get("repetition_penalty", 1.0)
+            if type(repetition_penalty) not in (int, float) or repetition_penalty != 1.0:
+                raise ValueError("only repetition_penalty=1.0 is supported")
+            if body.get("logprobs") is not None:
+                raise ValueError("only logprobs=null is supported")
+            if "stream_options" in body:
+                options = body["stream_options"]
+                if not streaming or not isinstance(options, dict) or set(options) - {"include_usage"}:
+                    raise ValueError("stream_options requires streaming and supports only include_usage")
+                self._include_usage = options.get("include_usage", False)
+                if type(self._include_usage) is not bool:
+                    raise ValueError("stream_options.include_usage must be boolean")
+            ignore_eos = body.get("ignore_eos", False)
+            if type(ignore_eos) is not bool:
+                raise ValueError("ignore_eos must be boolean")
+            return_token_ids = body.get("return_token_ids", False)
+            if type(return_token_ids) is not bool:
+                raise ValueError("return_token_ids must be boolean")
             prompt = body.get("prompt", body.get("input_ids"))
             if "input_ids" in body and not isinstance(prompt, list):
                 raise ValueError("input_ids must be a token list")
             if self._disconnected():
                 return
-            request = self.server.engine.submit(prompt, max_tokens=body.get("max_tokens"), request_id=body.get("request_id"))
+            request = self.server.engine.submit(prompt, max_tokens=body.get("max_tokens"),
+                                                request_id=body.get("request_id"), ignore_eos=ignore_eos)
+            if return_token_ids:
+                self._prompt_token_ids = list(request.prompt_ids)
             with self.server._connections_lock:
                 self.server._connections[self.connection] = True
             if streaming:
@@ -218,15 +255,23 @@ class CompletionHandler(BaseHTTPRequestHandler):
                     return
                 event = request.step(disconnect_check=self._disconnected)
                 if streaming and (event["token_id"] is not None or event["delta"]):
-                    self._sse(self._chunk(request, event["delta"], [] if event["token_id"] is None else [event["token_id"]]))
+                    self._sse(self._chunk(request, event["delta"],
+                                          [] if event["token_id"] is None else [event["token_id"]],
+                                          request.finish_reason))
+                    terminal_sent = request.finish_reason is not None
             if streaming:
-                self._sse(self._chunk(request, "", [], request.finish_reason))
+                # Match the upstream completion stream: the final token carries
+                # finish_reason, so the benchmark does not time an extra choice.
+                if not terminal_sent:
+                    self._sse(self._chunk(request, "", [], request.finish_reason))
+                if self._include_usage:
+                    usage = self._chunk(request, "", [])
+                    usage.update(choices=[], usage=self._usage(request))
+                    self._sse(usage)
                 self._sse("[DONE]")
             else:
                 result = self._chunk(request, request.text, request.token_ids, request.finish_reason)
-                result["usage"] = {"prompt_tokens": len(request.prompt_ids),
-                                   "completion_tokens": len(request.token_ids),
-                                   "total_tokens": len(request.prompt_ids) + len(request.token_ids)}
+                result["usage"] = self._usage(request)
                 self._json(200, result)
         except (BrokenPipeError, ConnectionError, TimeoutError, OSError):
             if request is not None and request.finish_reason == "error":
