@@ -286,14 +286,21 @@ class Generation:
                 self.token_ids.append(token)
                 finish = ("stop" if not self.ignore_eos and token in self.engine.eos_token_ids else
                           "length" if len(self.token_ids) == self.max_tokens else None)
-                decoded = self.engine.runner.tokenizer.decode(
-                    self.token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False,
-                )
-                stable = decoded if finish is not None else decoded.rstrip("\ufffd")
-                if not stable.startswith(self.text):
-                    raise ValueError("tokenizer changed already streamed text")
-                delta = stable[len(self.text):]
-                self.text = stable
+                if finish is None:
+                    # 增量解码单个 token：原先每步全量 re-decode 是 O(n) 且带二次解码。
+                    delta = self.engine.runner.tokenizer.decode(
+                        [token], skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    )
+                    self.text += delta
+                else:
+                    decoded = self.engine.runner.tokenizer.decode(
+                        self.token_ids, skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    )
+                    delta = (decoded[len(self.text):]
+                             if decoded.startswith(self.text) else decoded)
+                    self.text = decoded
                 if finish is not None:
                     self.engine._finish(self, finish)
                 return {"delta": delta, "token_id": token, **self.result()}

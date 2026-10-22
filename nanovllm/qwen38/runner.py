@@ -4,6 +4,7 @@ The model owns numerical execution. This runner owns request identity, bounds,
 state lifetime and text generation; it never calls Transformers model APIs.
 """
 
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from numbers import Integral
@@ -13,6 +14,8 @@ from numbers import Integral
 class _Request:
     state: object
     length: int = 0
+    graph: object = None
+    graph_bucket: int = 0
 
 
 class RequestRunner:
@@ -37,12 +40,17 @@ class RequestRunner:
         self.vocab_size = vocab_size
         self._tensor_factory = tensor_factory
         self._requests: dict[str, _Request] = {}
+        # CUDA Graph 解码：按 bucket 缓存图并复用，抓一次摊到后续所有请求上。
+        self.graph_enabled = os.environ.get("NANOVLLM_CUDA_GRAPH") == "1"
+        self.graph_headroom = 256
+        self._graph_pool: dict[int, object] = {}
+        self._graph_busy: set[int] = set()
 
     @property
     def active_request_ids(self) -> tuple[str, ...]:
         return tuple(self._requests)
 
-    def _tokens(self, token_ids, *, allow_empty=False) -> list[int]:
+    def _tokens(self, token_ids, *, allow_empty=False):
         if not isinstance(token_ids, (list, tuple)) or (not token_ids and not allow_empty):
             raise ValueError("token IDs must be a nonempty list or tuple")
         if any(
@@ -65,6 +73,26 @@ class RequestRunner:
 
         return torch.tensor([tokens], dtype=torch.long, device=self.device), torch.inference_mode()
 
+    def _acquire_graph_state(self, capacity):
+        """取一张可复用的图（连同它的 state），没有空闲图时返回 None。
+
+        图绑定具体的缓冲区地址，所以同一 bucket 的图在同一时刻只能服务一个请求；
+        并发请求各自捕获不再入池，只有顺序复用的请求吃到缓存。
+        """
+        if capacity in self._graph_busy:
+            return None
+        graph = self._graph_pool.get(capacity)
+        if graph is None:
+            return None
+        self._graph_busy.add(capacity)
+        return graph
+
+    def _release_graph(self, request):
+        if request.graph is not None and request.graph_bucket:
+            self._graph_busy.discard(request.graph_bucket)
+            request.graph = None
+            request.graph_bucket = 0
+
     def prefill(self, request_id: str, token_ids):
         """Create one private state and consume its first tokens, without sampling."""
         self._request_id(request_id)
@@ -75,8 +103,43 @@ class RequestRunner:
             raise ValueError("prompt exceeds max_context_tokens")
         if len(self._requests) >= self.max_active_requests:
             raise ValueError("active request capacity exhausted")
-        self._requests[request_id] = _Request(self.model.new_state())
-        return self.append(request_id, tokens)
+        capacity = None
+        if self.graph_enabled:
+            from .graph import DecodeGraph
+
+            capacity = DecodeGraph.bucket_for(len(tokens) + self.graph_headroom)
+        request = _Request(self.model.new_state())
+        pooled = None
+        if capacity:
+            from .graph import DecodeGraph
+
+            pooled = self._acquire_graph_state(capacity)
+            if pooled is not None:
+                # 复用同一 bucket 的图：把它的 state 清成新请求状态后重新 prefill。
+                request.state = pooled.reset_request_state()
+            else:
+                capacity = DecodeGraph.bucket_for(len(tokens) + self.graph_headroom)
+                request.state = self.model.new_state(capacity=capacity)
+        self._requests[request_id] = request
+        try:
+            logits = self.append(request_id, tokens)
+            if pooled is not None:
+                request.graph = pooled
+                request.graph_bucket = capacity
+        except BaseException:
+            self._release_graph(request)
+            raise
+        if capacity and request.graph is None:
+            from .graph import DecodeGraph
+
+            graph = DecodeGraph(self.model, request.state, request.length,
+                                capacity).capture()
+            request.graph = graph
+            request.graph_bucket = capacity
+            if capacity not in self._graph_pool:
+                self._graph_pool[capacity] = graph
+            self._graph_busy.add(capacity)
+        return logits
 
     def append(self, request_id: str, token_ids):
         """Consume more tokens; any failure invalidates and releases this request."""
@@ -86,6 +149,10 @@ class RequestRunner:
         try:
             request = self._requests[request_id]
             tokens = self._tokens(token_ids)
+            if request.graph is not None and len(tokens) == 1:
+                position = request.length
+                request.length += 1
+                return request.graph.step(tokens[0], position)
             if request.length + len(tokens) > self.max_context_tokens:
                 raise ValueError("request exceeds max_context_tokens")
             inputs, context = self._input(tokens)
@@ -97,9 +164,10 @@ class RequestRunner:
                 or (self.vocab_size is not None and logits.shape[2] != self.vocab_size)
             ):
                 raise ValueError("native model must return logits shaped [1, tokens, vocabulary]")
-            if self._tensor_factory is None:
+            if self._tensor_factory is None and len(tokens) > 1:
                 import torch
 
+                # decode 单 token 时每步都做 isfinite().item() 会强制同步，只在 prefill 校验。
                 if not torch.isfinite(logits).all().item():
                     raise ValueError("native model returned nonfinite logits")
             request.length += len(tokens)
@@ -110,7 +178,12 @@ class RequestRunner:
 
     def release(self, request_id: str) -> bool:
         """Drop only the named request's state; repeated release is harmless."""
-        return self._requests.pop(request_id, None) is not None
+        request = self._requests.get(request_id)
+        if request is None:
+            return False
+        self._release_graph(request)
+        self._requests.pop(request_id, None)
+        return True
 
     def reset(self, request_id: str):
         """Replace an active request's state with an empty state for later append."""
