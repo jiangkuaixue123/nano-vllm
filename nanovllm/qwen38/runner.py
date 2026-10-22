@@ -195,8 +195,11 @@ class RequestRunner:
         length = request.length
         for layer in state.layers:
             if getattr(layer, "capacity", 0):
-                layer.key = layer.key[:, :, :length].clone()
-                layer.value = layer.value[:, :, :length].clone()
+                # Linear-attention layers reserve conv/recurrent state, not KV.
+                # Preserve that history while switching every layer to eager.
+                if layer.key is not None:
+                    layer.key = layer.key[:, :, :length].clone()
+                    layer.value = layer.value[:, :, :length].clone()
                 layer.capacity = 0
         state.capacity = 0
         state.positions = None
