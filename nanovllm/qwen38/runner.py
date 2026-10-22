@@ -73,6 +73,40 @@ class RequestRunner:
 
         return torch.tensor([tokens], dtype=torch.long, device=self.device), torch.inference_mode()
 
+    def prewarm_graphs(self):
+        """启动时把所有桶各抓一遍，capture 成本计入 startup，不进 TTFT。
+
+        返回逐桶的 capture 耗时与常驻显存增量（字节），供 run 记录引用。
+        """
+        if not self.graph_enabled:
+            return {}
+        import time
+
+        import torch
+
+        from .graph import DecodeGraph
+
+        report = {"buckets": {}, "started_unix": time.time()}
+        before_all = torch.cuda.memory_allocated()
+        for capacity in DecodeGraph.BUCKETS:
+            if capacity in self._graph_pool:
+                continue
+            before = torch.cuda.memory_allocated()
+            started = time.perf_counter()
+            state = self.model.new_state(capacity=capacity)
+            graph = DecodeGraph(self.model, state, 0, capacity).capture()
+            self._graph_pool[capacity] = graph
+            self._graph_busy.discard(capacity)
+            report["buckets"][capacity] = {
+                "capture_seconds": time.perf_counter() - started,
+                "resident_MiB": (torch.cuda.memory_allocated() - before) / 2 ** 20,
+            }
+        report["total_seconds"] = sum(v["capture_seconds"] for v in report["buckets"].values())
+        report["resident_MiB_total"] = (torch.cuda.memory_allocated() - before_all) / 2 ** 20
+        report["completed_unix"] = time.time()
+        self.prewarm_report = report
+        return report
+
     def _acquire_graph_state(self, capacity):
         """取一张可复用的图（连同它的 state），没有空闲图时返回 None。
 
@@ -141,6 +175,33 @@ class RequestRunner:
             self._graph_busy.add(capacity)
         return logits
 
+    def _demote_graph(self, request):
+        """图容量用尽：把预分配 KV 压成紧凑布局，后续走 eager 路径。
+
+        图里烘焙的是这批预分配缓冲区的地址；state 被换成紧凑 clone 之后，池里那张图
+        就永久失效——必须从池里摘掉并清 busy 标记，否则下一次 acquire 会拿到它并
+        replay 到旧地址，产生静默的错误输出（不是崩溃）。
+        """
+        graph = request.graph
+        bucket = request.graph_bucket
+        request.graph = None
+        request.graph_bucket = 0
+        if graph is None:
+            return
+        if bucket:
+            self._graph_pool.pop(bucket, None)
+            self._graph_busy.discard(bucket)
+        state = request.state
+        length = request.length
+        for layer in state.layers:
+            if getattr(layer, "capacity", 0):
+                layer.key = layer.key[:, :, :length].clone()
+                layer.value = layer.value[:, :, :length].clone()
+                layer.capacity = 0
+        state.capacity = 0
+        state.positions = None
+        state.length = length
+
     def append(self, request_id: str, token_ids):
         """Consume more tokens; any failure invalidates and releases this request."""
         self._request_id(request_id)
@@ -151,8 +212,13 @@ class RequestRunner:
             tokens = self._tokens(token_ids)
             if request.graph is not None and len(tokens) == 1:
                 position = request.length
-                request.length += 1
-                return request.graph.step(tokens[0], position)
+                # 边界：桶容量与上下文上限都要先判，越界就永久退回 eager，
+                # 不能让图内 index_copy_ 越界（那是崩溃，不是回退）。
+                if (position + 1 <= request.graph.capacity
+                        and position + 1 <= self.max_context_tokens):
+                    request.length += 1
+                    return request.graph.step(tokens[0], position)
+                self._demote_graph(request)
             if request.length + len(tokens) > self.max_context_tokens:
                 raise ValueError("request exceeds max_context_tokens")
             inputs, context = self._input(tokens)
@@ -167,7 +233,10 @@ class RequestRunner:
             if self._tensor_factory is None and len(tokens) > 1:
                 import torch
 
-                # decode 单 token 时每步都做 isfinite().item() 会强制同步，只在 prefill 校验。
+                # 只在 prefill（多 token）校验非有限值。decode 单 token 时每步做
+                # isfinite(...).all().item() 会插入一次全量规约 + device 同步，
+                # 在 CUDA Graph 路径上还会直接阻断 capture；而 decode 的数值风险
+                # 由 prefill 校验与每步 argmax 的有限性间接覆盖。
                 if not torch.isfinite(logits).all().item():
                     raise ValueError("native model returned nonfinite logits")
             request.length += len(tokens)

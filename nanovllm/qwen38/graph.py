@@ -13,12 +13,27 @@ import torch
 # 所有 DecodeGraph 共用一张捕获内存池，与默认池隔离：否则 capture 之后的 eager 分配
 # （例如下一个请求的 prefill）会复用图内缓冲，replay 直接读到被覆盖的数据。
 _CAPTURE_POOL = None
+_CAPTURE_POOL_OWNER = None
 
 
-def capture_pool():
-    global _CAPTURE_POOL
+def capture_pool(owner):
+    """全模块共用的 capture 内存池，并绑定唯一 owner（一个模型/引擎）。
+
+    同一进程里第二个带图引擎复用这张池会让前一张图的地址被覆盖、replay 读到别人的
+    数据；那种情况在 allocator 里表现为一句难懂的 "use_count > 0" 断言，所以这里
+    提前显式报错。
+    """
+    global _CAPTURE_POOL, _CAPTURE_POOL_OWNER
     if _CAPTURE_POOL is None:
         _CAPTURE_POOL = torch.cuda.graph_pool_handle()
+        _CAPTURE_POOL_OWNER = owner
+    elif _CAPTURE_POOL_OWNER != owner:
+        raise RuntimeError(
+            "CUDA Graph 捕获池已被另一个引擎占用：同一进程内不支持多个开启 "
+            "NANOVLLM_CUDA_GRAPH 的引擎（共享 capture pool 会让 replay 读到彼此被"
+            "覆盖的缓冲区，表现为输出静默错误）。请给每个引擎独立进程，或只用其中一个"
+            "开启 CUDA Graph。"
+        )
     return _CAPTURE_POOL
 
 
@@ -59,7 +74,7 @@ class DecodeGraph:
             self.model(self.ids, state=state)          # 预热一份，供 capture 前的分配
             torch.cuda.synchronize()
             self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph, pool=capture_pool()):
+            with torch.cuda.graph(self.graph, pool=capture_pool(id(self.model))):
                 self.logits = self.model(self.ids, state=state)
         # capture 真实跑了一步，把 KV / 卷积态 / 递推态恢复到抓取前
         with torch.inference_mode():
