@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 
@@ -43,8 +45,14 @@ class FP8Linear(nn.Module):
             raise ValueError("Native FP8 execution requires colocated CUDA tensors")
         if torch.cuda.get_device_capability(inputs.device) != (9, 0):
             raise ValueError("Dedicated FP8 kernel requires SM90")
-        from ._triton_fp8 import matmul
+        from ._triton_fp8 import gemv, matmul
 
+        if inputs.numel() == self.in_features and os.environ.get("NANOVLLM_W8A16") == "1":
+            # decode 单 token：走权重直通的 GEMV，不碰 MMA。
+            self.native_fp8_calls += 1
+            return gemv(inputs.contiguous(), self.weight, self.weight_scale_inv).view(
+                *inputs.shape[:-1], self.out_features
+            )
         result = matmul(inputs.contiguous(), self.weight, self.weight_scale_inv)
         self.native_fp8_calls += 1
         return result

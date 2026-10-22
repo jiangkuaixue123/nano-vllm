@@ -61,3 +61,41 @@ def matmul(inputs, weight, scales):
             inputs, weight, scales, output, m, n, k, block_m, num_warps=4, num_stages=2,
         )
     return output
+
+@triton.jit
+def qwen38_w8a16_gemv(A, W, S, C, K: tl.constexpr, N: tl.constexpr,
+                      BN: tl.constexpr, BK: tl.constexpr):
+    """Decode 形状（M=1）权重直通：FP8 权重按 block-128 反量化后与 bf16 激活点积。
+
+    M=1 时 GEMM 是纯权重带宽问题，MMA 单元闲着。这里只流 FP8 权重（半字节宽），
+    反量化在寄存器里做，省下的正是 decode 线性层一半的 HBM 流量。
+    """
+    pid = tl.program_id(0)
+    offs_n = pid * BN + tl.arange(0, BN)
+    offs_k = tl.arange(0, BK)
+    acc = tl.zeros((BN,), tl.float32)
+    scale_row = (offs_n // 128) * (K // 128)
+    for k0 in range(0, K, BK):
+        kk = k0 + offs_k
+        a = tl.load(A + kk).to(tl.float32)                       # [BK] bf16 -> fp32
+        w = tl.load(W + offs_n[:, None] * K + kk[None, :],
+                    mask=(offs_n[:, None] < N), other=0.0)       # [BN, BK] fp8
+        s = tl.load(S + scale_row + (k0 // 128), mask=offs_n < N, other=0.0)
+        d = w.to(tl.float32) * s[:, None]
+        acc += tl.sum(d * a[None, :], axis=1)
+    tl.store(C + offs_n, acc.to(tl.bfloat16), mask=offs_n < N)
+
+
+def gemv(inputs, weight, scales):
+    """Single-token FP8 linear: stream FP8 weights, dequantize in registers."""
+    n, k = weight.shape
+    output = torch.empty(n, device=inputs.device, dtype=torch.bfloat16)
+    # BK 必须是 128 的整数倍：block scale 按 K/128 一档一个，跨档就要按子块分别取 scale。
+    # 目前只支持 BK=128（跨档版本未写），tile 由实测选出。
+    block_n, block_k = 32, 128
+    with torch.cuda.device(inputs.device):
+        qwen38_w8a16_gemv[(triton.cdiv(n, block_n),)](
+            inputs.reshape(-1), weight, scales, output,
+            k, n, block_n, block_k, num_warps=4, num_stages=3,
+        )
+    return output
