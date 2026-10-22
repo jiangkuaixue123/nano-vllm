@@ -44,6 +44,8 @@ class DedicatedEngine:
             raise ValueError("max_context_tokens exceeds model context limit")
         runner = RequestRunner(native, tokenizer, max_context_tokens=max_context_tokens,
                                max_active_requests=max_active_requests, vocab_size=native.config.vocab_size)
+        # 桶预热：把 5 个桶在启动时各抓一遍，capture 成本计入 startup，不进 TTFT。
+        self.prewarm_report = runner.prewarm_graphs() if runner.graph_enabled else {}
         model_id = "Qwen/Qwen3.8-27B-FP8" if report["dtype"] == "fp8" else "Qwen/Qwen3.8-27B"
         self._initialize(runner, eos, model_id, report)
 
@@ -185,6 +187,7 @@ class DedicatedEngine:
                                                     and module.weight_scale_inv.dtype == torch.float32
                                                     for module in modules.values())}}
         return {"model_id": self.model_id, "precision": self.loader_report["dtype"],
+                "graph_prewarm": getattr(self, "prewarm_report", {}),
                 "loader_report": self.loader_report, "module_origins": origins, "versions": versions,
                 **device, **execution}
 
@@ -232,6 +235,72 @@ class DedicatedEngine:
     exit = close
 
 
+class _IncrementalText:
+    """byte-level BPE 的增量解码。
+
+    decode([token]) 遇到不完整 UTF-8 会返回 U+FFFD；把这个替换字符流出去会让
+    self.text 与最终文本错位，finish 时 startswith 校验随之失败、整段重复下发。
+    这里只对"最近窗口"的 token 带上下文解码、rstrip 掉尾部未完成的替换字符，
+    再取相对上一窗口文本的增量；窗口回退时用最长公共前缀对齐，保证不重复。
+    """
+
+    WINDOW = 8
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.token_ids = []
+        self.text = ""
+        self._tail = []
+        self._tail_text = ""
+
+    def _decode(self, ids):
+        return self.tokenizer.decode(
+            ids, skip_special_tokens=True, clean_up_tokenization_spaces=False,
+        )
+
+    def _suffix_delta(self, full):
+        """返回 full 相对 self.text 的增量（最长公共前缀之后的部分）。"""
+        common = 0
+        limit = min(len(full), len(self.text))
+        while common < limit and full[common] == self.text[common]:
+            common += 1
+        return full[common:]
+
+    def push(self, token_id):
+        self.token_ids.append(token_id)
+        self._tail.append(token_id)
+        if len(self._tail) > self.WINDOW:
+            self._tail.pop(0)
+        # 基准取"本窗口去掉最后一个 token"的文本（常数代价），之前拿上一格整段窗口
+        # 的文本做基准，窗口一滑动首尾都不同，startswith 恒失败、每步退化成全量解码。
+        prefix = self._decode(self._tail[:-1]).rstrip("\ufffd")
+        window = self._decode(self._tail).rstrip("\ufffd")
+        if window.startswith(prefix):
+            delta = window[len(prefix):]
+            self.text += delta
+            return delta
+        # 极少数情况（字节级分词跨窗口边界）：退化为全量解码，用公共前缀对齐。
+        full = self._decode(self.token_ids).rstrip("\ufffd")
+        delta = self._suffix_delta(full)
+        self.text = full
+        return delta
+
+    def finish(self):
+        # 收尾只补最后一个窗口里被 rstrip 掉的部分（通常是最后一个未完成字符），
+        # 不做全量 re-decode：稳定文本已经在 push 中逐步累积。
+        window_full = self._decode(self._tail)
+        window_stable = window_full.rstrip("\ufffd")
+        if window_stable == "" or self.text.endswith(window_stable):
+            delta = window_full[len(window_stable):]
+            self.text += delta
+            return delta
+        # 兜底：窗口与已发文本对不齐时退回全量解码（正常路径不会走到）。
+        full = self._decode(self.token_ids)
+        delta = self._suffix_delta(full)
+        self.text = full
+        return delta
+
+
 class Generation:
     def __init__(self, engine, request_id, prompt_ids, max_tokens, ignore_eos):
         self.engine = engine
@@ -241,6 +310,7 @@ class Generation:
         self.ignore_eos = ignore_eos
         self.token_ids = []
         self.text = ""
+        self._text = _IncrementalText(engine.runner.tokenizer)
         self.started = False
         self.finish_reason = None
         self.cancelled = threading.Event()
@@ -255,8 +325,8 @@ class Generation:
             decoded = self.engine.runner.tokenizer.decode(
                 self.token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False,
             )
-            if not decoded.startswith(previous):
-                raise ValueError("tokenizer changed already streamed text")
+            # 不完整 UTF-8 可能让文本在中途分叉；两种分支都只把 self.text 对齐到
+            # tokenizer 的全量解码结果，delta 由下面 len(previous) 之后的部分给出。
             self.text = decoded
         except BaseException:
             self.engine._finish(self, "error")
@@ -286,21 +356,10 @@ class Generation:
                 self.token_ids.append(token)
                 finish = ("stop" if not self.ignore_eos and token in self.engine.eos_token_ids else
                           "length" if len(self.token_ids) == self.max_tokens else None)
-                if finish is None:
-                    # 增量解码单个 token：原先每步全量 re-decode 是 O(n) 且带二次解码。
-                    delta = self.engine.runner.tokenizer.decode(
-                        [token], skip_special_tokens=True,
-                        clean_up_tokenization_spaces=False,
-                    )
-                    self.text += delta
-                else:
-                    decoded = self.engine.runner.tokenizer.decode(
-                        self.token_ids, skip_special_tokens=True,
-                        clean_up_tokenization_spaces=False,
-                    )
-                    delta = (decoded[len(self.text):]
-                             if decoded.startswith(self.text) else decoded)
-                    self.text = decoded
+                delta = self._text.push(token)
+                if finish is not None:
+                    delta += self._text.finish()
+                self.text = self._text.text
                 if finish is not None:
                     self.engine._finish(self, finish)
                 return {"delta": delta, "token_id": token, **self.result()}

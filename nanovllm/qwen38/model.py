@@ -58,11 +58,15 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def _fused_weight(self, dtype):
-        # 零中心权重 1+w 只算一次，并按目标 dtype 缓存；推理期权重不变。
+        # 零中心权重 1+w 只算一次，并按 dtype 缓存。用 non-persistent buffer 而不是
+        # object.__setattr__：buffer 会跟随 .to()/.cuda() 迁移，否则先 forward 再换设备
+        # 会拿到旧 device 的缓存张量。
         cached = getattr(self, "_fused", None)
         if cached is None or cached.dtype is not dtype:
-            cached = (1.0 + self.weight.detach().float()).to(dtype)
-            object.__setattr__(self, "_fused", cached)
+            self.register_buffer(
+                "_fused", (1.0 + self.weight.detach().float()).to(dtype), persistent=False,
+            )
+            cached = self._fused
         return cached
 
     def forward(self, x):
@@ -78,11 +82,15 @@ class GatedRMSNorm(nn.Module):
     def _fused_weight(self, dtype):
         cached = getattr(self, "_fused", None)
         if cached is None or cached.dtype is not dtype:
-            cached = self.weight.detach().to(dtype)
-            object.__setattr__(self, "_fused", cached)
+            self.register_buffer(
+                "_fused", self.weight.detach().to(dtype), persistent=False,
+            )
+            cached = self._fused
         return cached
 
     def forward(self, x, gate):
+        # 数值路径变更：silu 由 fp32 改为按 x.dtype 计算（省两次 cast 与一次回写），
+        # 与 v7 之前的行为不同，已在 PR 说明里单独标注。
         return F.rms_norm(x, (x.shape[-1],), self._fused_weight(x.dtype), self.eps) * F.silu(gate)
 
 
