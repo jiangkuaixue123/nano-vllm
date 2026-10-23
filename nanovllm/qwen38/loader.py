@@ -57,7 +57,7 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError("Checkpoint index requires a nonempty weight map")
-    from .model import DeltaNet, FusedProjection
+    from .model import MLP, DeltaNet, FusedProjection
     from .quant import FP8Linear, FP8MergedLinear, fp8_report
 
     gdn_modules = [module for module in model.modules() if isinstance(module, DeltaNet)]
@@ -67,6 +67,10 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     if len(gdn_layouts) > 1:
         raise ValueError("GDN layers disagree on prefill execution layout")
     parameters = dict(model.named_parameters())
+    mlps = [module for module in model.modules() if isinstance(module, MLP)]
+    activation_backends = {module.activation_backend for module in mlps}
+    if len(activation_backends) > 1:
+        raise ValueError("Mixed MLP activation backends are unsupported")
     # 融合后的投影只有一份权重：把 checkpoint 里的 q_proj/k_proj/v_proj 等
     # 映射到这份权重的行切片视图上，加载时直接原地写入，不额外占显存。
     fused = [(name, module) for name, module in model.named_modules()
@@ -146,6 +150,11 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
             "backend": backend, "qk_layout": layout, "layers": len(gdn_modules),
             "query_key_heads": key_heads if layout == "grouped" else value_heads,
             "value_heads": value_heads, "decode_qk_layout": "expanded",
+        }
+    if mlps:
+        report["mlp_activation"] = {
+            "backend": activation_backends.pop(), "layers": len(mlps),
+            "silu_intermediate_dtype": "bfloat16",
         }
     if fp8_modules:
         report.update(fp8_report(fp8_modules.values()))
