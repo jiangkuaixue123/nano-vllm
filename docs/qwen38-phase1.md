@@ -144,3 +144,13 @@ This changes numerical rounding: prefill normalized Q/K are rounded to the
 activation dtype, and fused decode computes gates in FP32 without the native
 BF16 sigmoid intermediate. Operator, Graph, full-model quality and end-to-end
 qualification are required; enabling it is not a quality or parity claim.
+
+### Initial-prefill FlashAttention (experimental)
+
+`NANOVLLM_PREFILL_ATTENTION=sdpa_flash` uses PyTorch's explicit FlashAttention
+SDPA backend for an initial causal prefill, including grouped query attention.
+KV writes still populate the request cache before attention, and the operator
+uses compact prompt K/V. Cached continuations and Graph decode retain native
+position masking. The default is `native`; an unavailable Flash backend fails
+instead of silently selecting another SDPA backend. Removing materialized BF16
+scores changes rounding and needs separate numerical and task-quality checks.

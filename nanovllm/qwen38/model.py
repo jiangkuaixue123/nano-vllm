@@ -151,6 +151,9 @@ class FullAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.prefill_attention = os.environ.get("NANOVLLM_PREFILL_ATTENTION", "native")
+        if self.prefill_attention not in ("native", "sdpa_flash"):
+            raise ValueError(f"Unsupported NANOVLLM_PREFILL_ATTENTION: {self.prefill_attention}")
         q_size = config.num_attention_heads * config.head_dim
         kv_size = config.num_key_value_heads * config.head_dim
         self.q_proj = nn.Linear(config.hidden_size, q_size * 2, bias=False)
@@ -183,6 +186,9 @@ class FullAttention(nn.Module):
                 k = torch.cat((state.key, k), dim=2)
                 v = torch.cat((state.value, v), dim=2)
             state.key, state.value = k, v
+        if fresh_prefill and self.prefill_attention == "sdpa_flash":
+            result = flash_prefill(q, k, v).transpose(1, 2).reshape(1, count, -1)
+            return self.o_proj(result * gate.sigmoid())
         kv_heads = config.num_key_value_heads
         repeats = config.num_attention_heads // kv_heads
         # 分组 bmm，且**不做 broadcast**：q 按 (kv_head, repeat*count) 压成 batch=kv_heads，
@@ -224,6 +230,18 @@ class FullAttention(nn.Module):
         # The inspected reference uses sigmoid here; its output_gate_type
         # checkpoint field does not select an alternative activation.
         return self.o_proj(result * gate.sigmoid())
+
+
+def flash_prefill(query, key, value):
+    """Initial causal prefill only; require the actual FlashAttention backend."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    if not query.is_cuda:
+        raise ValueError("sdpa_flash prefill requires CUDA")
+    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+        return F.scaled_dot_product_attention(
+            query, key, value, dropout_p=0.0, is_causal=True, enable_gqa=True
+        )
 
 
 def normalize_qk(query, key):
