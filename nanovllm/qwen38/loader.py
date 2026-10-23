@@ -99,6 +99,7 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
                 fp8_parameter_names.add(f"{parent}.{part}")
 
     fp8_modules = {name: module for name, module in model.named_modules() if isinstance(module, FP8Linear)}
+    fp8_loading_report = fp8_report(fp8_modules.values()) if fp8_modules else {}
     expected_dtypes = {name: (torch.bfloat16, "BF16") for name in parameters}
     fp8_parameter_names.update(name for name, module in fp8_modules.items()
                                if not isinstance(module, FP8MergedLinear))
@@ -176,7 +177,7 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
             "silu_intermediate_dtype": "bfloat16",
         }
     if fp8_modules:
-        report.update(fp8_report(fp8_modules.values()))
+        report.update(fp8_loading_report)
         report["projection_layout"] = (
             "merged" if any(isinstance(module, FP8MergedLinear) for module in fp8_modules.values())
             else "separate"

@@ -31,6 +31,9 @@ class FP8Linear(nn.Module):
             )
         self.use_flashinfer = requested in ("flashinfer", "flashinfer_deepgemm")
         self.use_deepgemm = requested == "flashinfer_deepgemm"
+        self.deepgemm_quantization = os.environ.get("NANOVLLM_DEEPGEMM_QUANTIZATION", "native")
+        if self.deepgemm_quantization not in ("native", "row4"):
+            raise ValueError(f"Unsupported NANOVLLM_DEEPGEMM_QUANTIZATION={self.deepgemm_quantization!r}")
         if self.use_flashinfer:
             self.backend = "flashinfer_small_m_triton_prefill"
             self.kernel_name = "fp8_blockscale_gemm_sm90+qwen38_block_fp8"
@@ -50,6 +53,7 @@ class FP8Linear(nn.Module):
         ), requires_grad=False)
         self.native_fp8_calls = 0
         self.kernel_calls = {"flashinfer": 0, "triton": 0, "deepgemm": 0}
+        self.deepgemm_quantization_calls = {"native": 0, "row4": 0}
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         if inputs.ndim < 2 or inputs.shape[-1] != self.in_features or inputs.numel() == 0:
@@ -79,12 +83,16 @@ class FP8Linear(nn.Module):
             ).reshape(*inputs.shape[:-1], self.out_features)
             self.kernel_calls["flashinfer"] += 1
         elif self.use_deepgemm:
-            from ._deepgemm_fp8 import matmul
+            if self.deepgemm_quantization == "row4":
+                from ._triton_quant4 import matmul
+            else:
+                from ._deepgemm_fp8 import matmul
 
             result = matmul(inputs.reshape(rows, self.in_features).contiguous(),
                             self.weight, self.weight_scale_inv)
             result = result.reshape(*inputs.shape[:-1], self.out_features)
             self.kernel_calls["deepgemm"] += 1
+            self.deepgemm_quantization_calls[self.deepgemm_quantization] += 1
         else:
             from ._triton_fp8 import matmul
 
@@ -140,6 +148,7 @@ def fuse_fp8_projections(model):
         if (not all(type(part) is FP8Linear for part in parts)
                 or not all(part.weight.is_meta and part.weight_scale_inv.is_meta for part in parts)
                 or len({part.in_features for part in parts}) != 1
+                or len({part.deepgemm_quantization for part in parts}) != 1
                 or len({part.backend for part in parts}) != 1):
             raise ValueError("FP8 projection fusion requires unallocated compatible FP8 linears")
         first = parts[0]
@@ -147,7 +156,7 @@ def fuse_fp8_projections(model):
             first.in_features, [part.out_features for part in parts], names, device="meta",
         )
         # Backend selection belongs to the original constructed modules.
-        for attribute in ("use_flashinfer", "use_deepgemm", "backend", "kernel_name"):
+        for attribute in ("use_flashinfer", "use_deepgemm", "backend", "kernel_name", "deepgemm_quantization"):
             setattr(merged, attribute, getattr(first, attribute))
         groups.append((parent, target, names, merged))
     if not groups:
@@ -235,9 +244,11 @@ def convert_fp8_linears(model: nn.Module, exclusions: tuple[str, ...]) -> int:
 def fp8_report(modules) -> dict:
     modules = tuple(modules)
     backends = {(module.backend, module.kernel_name) for module in modules}
-    if len(backends) != 1:
+    quantizers = {(module.deepgemm_quantization, module.use_deepgemm) for module in modules}
+    if len(backends) != 1 or len(quantizers) != 1:
         raise ValueError("FP8 loading requires one consistent backend selection")
     backend, kernel_name = next(iter(backends))
+    quantizer, active = next(iter(quantizers))
     return {
         "dtype": "fp8", "activation_dtype": "bfloat16",
         "weight_dtype": "float8_e4m3fn", "scale_dtype": "float32",
@@ -245,4 +256,9 @@ def fp8_report(modules) -> dict:
         "execution": "native_fp8", "fp8_linear_modules": len(modules),
         "dequantized": False, "backend": backend,
         "kernel_name": kernel_name,
+        "deepgemm_quantization": {
+            "backend": quantizer, "active": active, "group_size": 128,
+            "rows_per_program": 4 if quantizer == "row4" else 1,
+            "scale_dtype": "float32", "scale_layout": "column_major_padded4",
+        },
     }
