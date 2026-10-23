@@ -50,6 +50,11 @@ def test_cached_continuation_stays_native(monkeypatch):
     layer(torch.randn(1, 2, cfg.hidden_size), state, positions,
           cos[None, None], sin[None, None], fresh_prefill=False)
     assert state.key.shape[2] == 2
+    positions = torch.arange(2, 4)
+    cos, sin = rotary_tables(cfg, positions, torch.float32)
+    layer(torch.randn(1, 2, cfg.hidden_size), state, positions,
+          cos[None, None], sin[None, None], fresh_prefill=False)
+    assert state.key.shape[2] == 4
 
 
 def test_unknown_backend_and_cpu_fail_closed(monkeypatch):
