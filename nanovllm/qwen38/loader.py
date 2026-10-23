@@ -73,6 +73,9 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
                         for module in gdn_modules}
     if len(gdn_convolutions) > 1:
         raise ValueError("GDN layers disagree on convolution backend or window")
+    gdn_qk_norms = {module.gdn_qk_norm_backend for module in gdn_modules}
+    if len(gdn_qk_norms) > 1:
+        raise ValueError("Mixed whole Q/K normalization backends are unsupported")
     parameters = dict(model.named_parameters())
     mlps = [module for module in model.modules() if isinstance(module, MLP)]
     activation_backends = {module.activation_backend for module in mlps}
@@ -174,6 +177,13 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
         report["gdn_outnorm"] = {
             "backend": outnorm_backends.pop(), "layers": len(gdn_modules),
             "norm_intermediate_dtype": "bfloat16", "silu_intermediate_dtype": "bfloat16",
+        }
+        report["gdn_qk_normalization"] = {
+            "requested_backend": gdn_qk_norms.pop(), "layers": len(gdn_modules),
+            "scope": "grouped_prefill_whole_l2", "candidate_reduction": "triton_fp32_sum",
+            "cross_backend_comparison": "diagnostic_reduction_order_differs",
+            "fallback": "native_for_unsupported_operand_metadata",
+            "decode": "unchanged", "execution_observed": False,
         }
     if mlps:
         report["mlp_activation"] = {
