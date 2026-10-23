@@ -90,6 +90,39 @@ class Tokenizer:
         return [1, 2]
 
 
+class LastRowModel(NativeModel):
+    prefill_logits = "last"
+
+    def __call__(self, inputs, *, state):
+        result = super().__call__(inputs, state=state)
+        return Logits(result.rows[-1:], 8)
+
+
+def test_last_row_mode_consumes_every_token_and_preserves_generation():
+    reduced = RequestRunner(LastRowModel(), tensor_factory=lambda value: value,
+                            max_context_tokens=12, vocab_size=8)
+    assert reduced.prefill("last", [1, 2, 3]).shape == (1, 1, 8)
+    assert reduced._requests["last"].length == 3
+    assert reduced._requests["last"].state["tokens"] == [1, 2, 3]
+    assert reduced.append("last", [4, 5]).shape == (1, 1, 8)
+    assert reduced._requests["last"].length == 5
+    assert reduced._requests["last"].state["tokens"] == [1, 2, 3, 4, 5]
+    reduced.release("last")
+    expected = runner().generate([1, 2, 3], max_tokens=4)
+    actual = reduced.generate([1, 2, 3], max_tokens=4)
+    assert actual == expected
+    assert reduced.active_request_ids == ()
+
+
+def test_declared_last_row_mode_rejects_full_rows_and_releases_state():
+    model = NativeModel()
+    model.prefill_logits = "last"
+    reduced = RequestRunner(model, tensor_factory=lambda value: value,
+                            max_context_tokens=12, vocab_size=8)
+    with pytest.raises(ValueError, match="declared output rows"):
+        reduced.prefill("invalid", [1, 2])
+    assert reduced.active_request_ids == ()
+
 def runner(**kwargs):
     return RequestRunner(
         NativeModel(), tensor_factory=lambda value: value, max_context_tokens=12,

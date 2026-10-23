@@ -192,6 +192,7 @@ class DedicatedEngine:
                                                     and module.weight_scale_inv.dtype == torch.float32
                                                     for module in modules.values())}}
         return {"model_id": self.model_id, "precision": self.loader_report["dtype"],
+                "prefill_logits": getattr(self.runner, "prefill_logits", "all"),
                 "graph_prewarm": getattr(self, "prewarm_report", {}),
                 "loader_report": self.loader_report, "module_origins": origins, "versions": versions,
                 **device, **execution}
