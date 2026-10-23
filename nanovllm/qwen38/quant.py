@@ -93,6 +93,72 @@ class FP8Linear(nn.Module):
         return result
 
 
+class FP8MergedLinear(FP8Linear):
+    """Concatenate independent output rows without changing FP8 blocks.
+
+    Every original projection starts at a 128-row scale boundary. Checkpoint
+    weights and scales load directly into slices of the single allocation.
+    """
+
+    def __init__(self, in_features, out_sizes, names, *, device=None):
+        self.out_sizes = tuple(out_sizes)
+        self.names = tuple(names)
+        if (not self.out_sizes or len(self.out_sizes) != len(self.names)
+                or len(set(self.names)) != len(self.names)
+                or in_features % 128
+                or any(size <= 0 or size % 128 for size in self.out_sizes)):
+            raise ValueError("Merged FP8 projections require distinct names and 128-aligned blocks")
+        super().__init__(in_features, sum(self.out_sizes), device=device)
+
+    def part_ranges(self):
+        start = 0
+        ranges = {}
+        for name, size in zip(self.names, self.out_sizes):
+            ranges[name] = (start, start + size)
+            start += size
+        return ranges
+
+    def forward(self, inputs):
+        return super().forward(inputs).split(self.out_sizes, dim=-1)
+
+
+def fuse_fp8_projections(model):
+    """Structural fusion on meta only, before allocating or loading weights."""
+    from .model import MLP, DeltaNet, FullAttention
+
+    groups = []
+    for parent in model.modules():
+        if isinstance(parent, MLP):
+            target, names = "gate_up_proj", ("gate_proj", "up_proj")
+        elif isinstance(parent, FullAttention):
+            target, names = "qkv_proj", ("q_proj", "k_proj", "v_proj")
+        elif isinstance(parent, DeltaNet):
+            target, names = "in_proj_qkvz", ("in_proj_qkv", "in_proj_z")
+        else:
+            continue
+        parts = [getattr(parent, name, None) for name in names]
+        if (not all(type(part) is FP8Linear for part in parts)
+                or not all(part.weight.is_meta and part.weight_scale_inv.is_meta for part in parts)
+                or len({part.in_features for part in parts}) != 1
+                or len({part.backend for part in parts}) != 1):
+            raise ValueError("FP8 projection fusion requires unallocated compatible FP8 linears")
+        first = parts[0]
+        merged = FP8MergedLinear(
+            first.in_features, [part.out_features for part in parts], names, device="meta",
+        )
+        # Backend selection belongs to the original constructed modules.
+        for attribute in ("use_flashinfer", "use_deepgemm", "backend", "kernel_name"):
+            setattr(merged, attribute, getattr(first, attribute))
+        groups.append((parent, target, names, merged))
+    if not groups:
+        raise ValueError("No supported FP8 projection groups")
+    for parent, target, names, merged in groups:
+        for name in names:
+            delattr(parent, name)
+        setattr(parent, target, merged)
+    return len(groups)
+
+
 def convert_fp8_linears(model: nn.Module, exclusions: tuple[str, ...]) -> int:
     """Replace precisely the supported text projections, checking HF exclusions.
 
