@@ -177,3 +177,22 @@ without importing its runtime. Changing GEMM output width can change cuBLAS
 reduction order and BF16 outputs. CPU layout/loading checks do not establish
 numerical equivalence, Graph correctness, model quality or service speedup;
 those remain unverified pending their corresponding GPU and acceptance checks.
+
+### Optional final-row prefill logits
+
+`NANOVLLM_PREFILL_LOGITS=last` selects the final hidden row before the last
+normalization and vocabulary projection. Every prompt token still executes all
+decoder layers and updates the complete attention and recurrent state. The same
+selection applies to multi-token cached continuations; single-token Graph decode
+already projects one row. Health provenance reports the instantiated mode.
+
+The default `all` preserves the `[1, tokens, vocabulary]` return shape. Opt-in
+`last` returns `[1, 1, vocabulary]`; the request runner checks that declared shape
+and consumes the full input token count. Generation and teacher-forced next-token
+tracing use the last row, so they retain their interfaces. Callers requiring
+logits for every prompt position must use `all`.
+
+This avoids projecting unused prompt positions, following the selected-hidden-row
+approach used by vLLM before its logits processor. A different GEMM row count can
+change accumulation; CPU tests do not establish production token equality,
+task quality or end-to-end speedup. Those remain GPU validation requirements.

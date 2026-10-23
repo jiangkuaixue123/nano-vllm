@@ -33,6 +33,9 @@ class RequestRunner:
         if vocab_size is not None and (type(vocab_size) is not int or vocab_size <= 0):
             raise ValueError("vocab_size must be a positive integer")
         self.model = model
+        self.prefill_logits = getattr(model, "prefill_logits", "all")
+        if self.prefill_logits not in ("all", "last"):
+            raise ValueError("model prefill_logits must be all or last")
         self.tokenizer = tokenizer
         self.max_context_tokens = max_context_tokens
         self.max_active_requests = max_active_requests
@@ -243,12 +246,13 @@ class RequestRunner:
             inputs, context = self._input(tokens)
             with context:
                 logits = self.model(inputs, state=request.state)
+            output_rows = 1 if self.prefill_logits == "last" else len(tokens)
             if (
-                len(logits.shape) != 3 or tuple(logits.shape[:2]) != (1, len(tokens))
+                len(logits.shape) != 3 or tuple(logits.shape[:2]) != (1, output_rows)
                 or logits.shape[2] <= 0
                 or (self.vocab_size is not None and logits.shape[2] != self.vocab_size)
             ):
-                raise ValueError("native model must return logits shaped [1, tokens, vocabulary]")
+                raise ValueError("native model must return logits for the declared output rows")
             if self._tensor_factory is None and len(tokens) > 1:
                 import torch
 

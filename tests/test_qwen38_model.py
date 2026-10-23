@@ -85,6 +85,45 @@ def test_full_prefill_matches_reference(dtype, length):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_last_logits_projects_one_row_and_preserves_complete_state(monkeypatch, dtype):
+    monkeypatch.setenv("NANOVLLM_PREFILL_LOGITS", "all")
+    full, _ = make_models(dtype)
+    monkeypatch.setenv("NANOVLLM_PREFILL_LOGITS", "last")
+    reduced = Qwen38ForCausalLM(full.config).to(dtype=dtype).eval()
+    reduced.load_state_dict(full.state_dict(), strict=True)
+    expected_state, actual_state = full.new_state(), reduced.new_state()
+    projected_rows = []
+    hook = reduced.lm_head.register_forward_pre_hook(
+        lambda _module, args: projected_rows.append(args[0].shape[1])
+    )
+    try:
+        # Fresh prefill, cached multi-token continuation, then single-token decode.
+        for tokens in ([1, 2, 3, 4], [5, 6, 7], [8]):
+            ids = torch.tensor([tokens])
+            expected = full(ids, state=expected_state)
+            actual = reduced(ids, state=actual_state)
+            assert actual.shape == (1, 1, full.config.vocab_size)
+            assert_logits(actual, expected[:, -1:], dtype)
+            assert actual_state.length == expected_state.length
+            for observed, reference in zip(actual_state.layers, expected_state.layers):
+                for name in ("key", "value", "conv", "recurrent"):
+                    a, b = getattr(observed, name), getattr(reference, name)
+                    if b is None:
+                        assert a is None
+                    else:
+                        torch.testing.assert_close(a, b, rtol=0, atol=0)
+    finally:
+        hook.remove()
+    assert projected_rows == [1, 1, 1]
+
+
+def test_last_logits_mode_is_validated_before_model_allocation(monkeypatch):
+    monkeypatch.setenv("NANOVLLM_PREFILL_LOGITS", "invalid")
+    with pytest.raises(ValueError, match="NANOVLLM_PREFILL_LOGITS"):
+        Qwen38ForCausalLM(Qwen38TextConfig.for_testing())
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("chunks", [(3, 1, 1, 1), (1, 2, 4), (63, 2, 1)])
 def test_cached_and_chunked_prefill_match_reference(dtype, chunks):
     native, reference = make_models(dtype, seed=11)

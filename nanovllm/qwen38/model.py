@@ -495,6 +495,9 @@ class TextModel(nn.Module):
 class Qwen38ForCausalLM(nn.Module):
     def __init__(self, config: Qwen38TextConfig):
         super().__init__()
+        self.prefill_logits = os.environ.get("NANOVLLM_PREFILL_LOGITS", "all")
+        if self.prefill_logits not in ("all", "last"):
+            raise ValueError("NANOVLLM_PREFILL_LOGITS must be all or last")
         self.config = config
         self.model = TextModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -608,6 +611,12 @@ class Qwen38ForCausalLM(nn.Module):
         for layer, layer_state in zip(self.model.layers, pending):
             hidden = layer(hidden, layer_state, positions, cos, sin,
                            fresh_prefill=state.length == 0 and state.positions is None)
+        # Every input token still updates attention/recurrent state. Generation
+        # needs only the final row; select it before the vocabulary projection.
+        # The opt-in also covers cached multi-token continuations. Default mode
+        # retains the complete [1, tokens, vocabulary] model API.
+        if self.prefill_logits == "last":
+            hidden = hidden[:, -1:, :]
         logits = self.lm_head(self.model.norm(hidden))
         state.layers = pending
         if state.positions is None:
