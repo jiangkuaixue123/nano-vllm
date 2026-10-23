@@ -65,8 +65,8 @@ class FP8Linear(nn.Module):
         return result
 
     def _matmul(self, inputs: torch.Tensor) -> torch.Tensor:
-        # Match vLLM's small-M SM90 choice. Large prefill keeps the existing
-        # kernel; FlashInfer's BF16 input path quantizes activations internally.
+        # Match vLLM's small-M SM90 choice; prefill follows the selected backend.
+        # FlashInfer's BF16 input path quantizes activations internally.
         rows = inputs.numel() // self.in_features
         if self.use_flashinfer and rows < 32:
             if self.in_features % 128 or self.out_features % 64:
