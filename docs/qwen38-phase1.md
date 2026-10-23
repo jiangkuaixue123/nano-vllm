@@ -144,3 +144,18 @@ This changes numerical rounding: prefill normalized Q/K are rounded to the
 activation dtype, and fused decode computes gates in FP32 without the native
 BF16 sigmoid intermediate. Operator, Graph, full-model quality and end-to-end
 qualification are required; enabling it is not a quality or parity claim.
+
+### Merged FP8 projections (experimental)
+
+`NANOVLLM_FP8_PROJECTIONS=merged` combines gate/up, Q/K/V and GDN QKV/Z
+projections before allocation. The default is `separate`. Only complete
+128-row scale blocks are concatenated; each checkpoint FP8 byte and its original
+multiplier load directly into the corresponding slice. No weight requantization
+or dense fallback is performed. GDN A/B and the language-model head keep their
+existing BF16 paths. In the supported architecture this reduces FP8 linear
+modules from 400 to 256 and shares the input quantization within each group.
+
+This follows vLLM's merged projection layout without importing its runtime.
+Larger GEMM output shapes can change floating-point accumulation, so structural
+CPU tests do not establish numerical equivalence or a service speedup. Operator,
+Graph, task-quality and end-to-end comparisons remain required before acceptance.

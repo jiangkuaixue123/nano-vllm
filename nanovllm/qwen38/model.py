@@ -350,6 +350,9 @@ class DeltaNet(nn.Module):
         config, count = self.config, x.shape[1]
         if hasattr(self, "in_proj_fused"):
             qkv_lin, z_lin, b_lin, a_lin = self.in_proj_fused(x)
+        elif hasattr(self, "in_proj_qkvz"):
+            qkv_lin, z_lin = self.in_proj_qkvz(x)
+            b_lin, a_lin = self.in_proj_b(x), self.in_proj_a(x)
         else:
             qkv_lin, z_lin = self.in_proj_qkv(x), self.in_proj_z(x)
             b_lin, a_lin = self.in_proj_b(x), self.in_proj_a(x)

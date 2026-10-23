@@ -8,6 +8,7 @@ dtype; it does not turn a local index into trusted provenance.
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
 
@@ -57,14 +58,18 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError("Checkpoint index requires a nonempty weight map")
     from .model import FusedProjection
+    from .quant import FP8Linear, FP8MergedLinear, fp8_report
 
     parameters = dict(model.named_parameters())
     # 融合后的投影只有一份权重：把 checkpoint 里的 q_proj/k_proj/v_proj 等
     # 映射到这份权重的行切片视图上，加载时直接原地写入，不额外占显存。
     fused = [(name, module) for name, module in model.named_modules()
-             if isinstance(module, FusedProjection)]
+             if isinstance(module, (FusedProjection, FP8MergedLinear))]
     for name, _module in fused:
         parameters.pop(name + ".weight", None)
+        if isinstance(_module, FP8MergedLinear):
+            parameters.pop(name + ".weight_scale_inv")
+    fp8_parameter_names = set()
     for name, module in fused:
         # 融合模块挂在 <parent>.qkv_proj / .in_proj_fused / .gate_up_proj 下，
         # 而 checkpoint 里是 <parent>.q_proj.weight 这种原始名，所以要去掉这一段。
@@ -72,11 +77,15 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
         weight = module.weight
         for part, (start, end) in module.part_ranges().items():
             parameters[f"{parent}.{part}.weight"] = weight[start:end]
-    from .quant import FP8Linear, fp8_report
+            if isinstance(module, FP8MergedLinear):
+                parameters[f"{parent}.{part}.weight_scale_inv"] = module.weight_scale_inv[start // 128:end // 128]
+                fp8_parameter_names.add(f"{parent}.{part}")
 
     fp8_modules = {name: module for name, module in model.named_modules() if isinstance(module, FP8Linear)}
     expected_dtypes = {name: (torch.bfloat16, "BF16") for name in parameters}
-    for name in fp8_modules:
+    fp8_parameter_names.update(name for name, module in fp8_modules.items()
+                               if not isinstance(module, FP8MergedLinear))
+    for name in fp8_parameter_names:
         expected_dtypes[name + ".weight"] = (torch.float8_e4m3fn, "F8_E4M3")
         expected_dtypes[name + ".weight_scale_inv"] = (torch.float32, "BF16")
     if not parameters or any(p.dtype != expected_dtypes[name][0] or p.is_meta for name, p in parameters.items()):
@@ -127,6 +136,10 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
               "scope": "text_only", "dtype": "bfloat16"}
     if fp8_modules:
         report.update(fp8_report(fp8_modules.values()))
+        report["projection_layout"] = (
+            "merged" if any(isinstance(module, FP8MergedLinear) for module in fp8_modules.values())
+            else "separate"
+        )
     return report
 
 
@@ -142,6 +155,11 @@ def load_checkpoint(model_path: str | Path, *, device: str = "cuda:0"):
     root = Path(model_path).resolve(strict=True)
     raw = json.loads(_file(root, "config.json").read_bytes(), object_pairs_hook=_object)
     config = Qwen38TextConfig.from_dict(raw, strict=True)
+    projection_layout = os.environ.get("NANOVLLM_FP8_PROJECTIONS", "separate")
+    if projection_layout not in ("separate", "merged"):
+        raise ValueError("Unsupported NANOVLLM_FP8_PROJECTIONS")
+    if projection_layout == "merged" and config.weight_format != "fp8":
+        raise ValueError("Merged FP8 projections require an FP8 checkpoint")
     with torch.device("meta"):
         model = Qwen38ForCausalLM(config).to(dtype=torch.bfloat16)
         if config.weight_format == "fp8":
@@ -152,8 +170,11 @@ def load_checkpoint(model_path: str | Path, *, device: str = "cuda:0"):
             # Do not call model.to(dtype=...) after this: FP8 weights and FP32
             # multipliers must retain their distinct representation.
             convert_fp8_linears(model, config.modules_to_not_convert)
+            if projection_layout == "merged":
+                from .quant import fuse_fp8_projections
+
+                fuse_fp8_projections(model)
         else:
-            # BF16 路径才融合投影；FP8Linear 带 block scale，合并需要重排 scale，本轮不做。
             model.fuse_projections()
     model.to_empty(device=device)
     report = load_weights(model, root)
