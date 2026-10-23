@@ -81,9 +81,11 @@ def compare(actual, reference):
     finite = torch.isfinite(a) & torch.isfinite(b)
     delta = (a[finite].double() - b[finite].double()).abs()
     return {
+        "actual_dtype": str(actual.dtype), "reference_dtype": str(reference.dtype),
         "shape": list(actual.shape), "actual_stride": list(actual.stride()),
         "reference_stride": list(reference.stride()),
         "bit_mismatches": int((actual.view(torch.int16) != reference.view(torch.int16)).sum().item()),
+        "finite_bit_mismatches": int(((actual.view(torch.int16) != reference.view(torch.int16)) & finite).sum().item()),
         "finite_pairs": int(finite.sum().item()),
         "finite_max_abs": float(delta.max().item()) if delta.numel() else None,
         "finite_rmse": float(delta.square().mean().sqrt().item()) if delta.numel() else None,
