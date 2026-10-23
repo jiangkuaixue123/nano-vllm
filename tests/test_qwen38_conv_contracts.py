@@ -46,9 +46,14 @@ class Tensor:
 
     def __getitem__(self, key):
         shape = tuple(len(range(*item.indices(size))) for size, item in zip(self.shape, key))
-        return Tensor(shape, self.strides)
+        result = Tensor(shape, self.strides, self.dtype, self.device.name)
+        if hasattr(self, "clone_factory"):
+            result.clone_factory = self.clone_factory
+        return result
 
     def clone(self):
+        if hasattr(self, "clone_factory"):
+            return self.clone_factory(self)
         return Tensor(self.shape)
 
     def copy_(self, source):
@@ -137,8 +142,48 @@ def test_consumer_dispatch_and_state_ownership(monkeypatch, backend, buffered, p
         assert (state.conv is old) is buffered
 
 
+def clone_strides(tensor):
+    """Pinned ATen clone/empty_like Preserve layout rules, without tensor data."""
+    shape, strides = tensor.shape, tensor.stride()
+    expected = 1
+    for dim in sorted(range(len(shape)), key=lambda d: strides[d]):
+        if shape[dim] == 1:
+            continue
+        if strides[dim] != expected:
+            break
+        expected *= shape[dim]
+    else:
+        return strides
+
+    # infer_dense_strides: reverse order, then stable stride/size insertion sort.
+    order = list(reversed(range(len(shape))))
+    for i in range(1, len(order)):
+        right = i
+        for left in reversed(range(i)):
+            a, b = order[left], order[right]
+            if strides[a] > strides[b] or (strides[a] == strides[b] and shape[a] > shape[b]):
+                order[left], order[right] = order[right], order[left]
+                right = left
+            elif strides[a] < strides[b]:
+                break
+    result, expected = [0] * len(shape), 1
+    for dim in order:
+        result[dim] = expected
+        expected *= max(shape[dim], 1)
+    return tuple(result)
+
+
 def wrapper():
     launches = []
+    allocations = []
+
+    def allocate(kind, shape, strides=None, *, dtype="bf16", device="cuda:0"):
+        name = device if isinstance(device, str) else device.name
+        tensor = Tensor(shape, strides, dtype, name)
+        tensor.clone_factory = lambda t: allocate("clone", t.shape, clone_strides(t),
+                                                  dtype=t.dtype, device=t.device)
+        allocations.append((kind, tensor))
+        return tensor
 
     class Kernel:
         def __getitem__(self, grid):
@@ -146,19 +191,20 @@ def wrapper():
 
     torch = NS(bfloat16="bf16", version=NS(hip=None), is_grad_enabled=lambda: False,
                cuda=NS(device=lambda _: contextlib.nullcontext()),
-               empty=lambda shape, **kw: Tensor(shape),
-               empty_like=lambda x: Tensor(x.shape, x.strides))
+               empty=lambda shape, **kw: allocate("empty", shape, **kw),
+               empty_strided=lambda shape, strides, **kw: allocate("empty_strided", shape, strides, **kw),
+               allocations=allocations)
     ns = {"torch": torch, "triton": NS(cdiv=lambda x, y: (x + y - 1) // y),
           "_conv_silu_kernel": Kernel()}
-    execute([next(n for n in nodes("_triton_conv.py")
-                  if getattr(n, "name", None) == "causal_conv_silu")], ns)
+    execute([n for n in nodes("_triton_conv.py")
+             if getattr(n, "name", None) in {"_fresh_state", "causal_conv_silu"}], ns)
     return ns["causal_conv_silu"], launches, torch
 
 
 @pytest.mark.parametrize("count,decode", [(1, False), (3, False), (4, False), (8192, False), (1, True)])
 @pytest.mark.parametrize("buffered", [False, True])
 def test_wrapper_passes_split_strides_and_retains_buffer(count, decode, buffered):
-    call, launches, _ = wrapper()
+    call, launches, torch = wrapper()
     raw = Tensor((1, 33, count), (count * 48, 1, 48))
     weight = Tensor((33, 1, 4), (8, 8, 2))
     history = Tensor((1, 33, 4), (132, 1, 33)) if decode else None
@@ -175,6 +221,77 @@ def test_wrapper_passes_split_strides_and_retains_buffer(count, decode, buffered
     assert grid == ((33 + (127 if decode else 31)) // (128 if decode else 32),
                     1 if decode else (count + 31) // 32)
     assert options == {"num_warps": 4, "enable_fp_fusion": False}
+    assert sum(t.device.type == "meta" for _, t in torch.allocations) == (
+        3 if not buffered and not decode and count >= 4 else 0)
+
+
+STATE_LAYOUT_CASES = [
+    # Merged projection, packed NC, dense NCL, and accepted singleton axes.
+    (10240, 4, (65536, 1, 16384), (40960, 1, 10240)),
+    (10240, 33, (540672, 1, 16384), (337920, 1, 10240)),
+    (10240, 8192, (134217728, 1, 16384), (83886080, 1, 10240)),
+    (33, 4, (132, 1, 33), (132, 1, 33)),
+    (33, 33, (1089, 1, 33), (1089, 1, 33)),
+    (33, 8192, (270336, 1, 33), (270336, 1, 33)),
+    (33, 4, (132, 4, 1), (132, 4, 1)),
+    (33, 33, (1089, 33, 1), (132, 4, 1)),
+    (33, 8192, (270336, 8192, 1), (132, 4, 1)),
+    (33, 5, (165, 1, 33), (165, 1, 33)),
+    (1, 4, (700, 70, 1), (700, 70, 1)),
+    (1, 33, (700, 70, 1), (700, 70, 1)),
+    (1, 8192, (16384, 16384, 2), (8192, 8192, 1)),
+    (1, 1, (70, 70, 1), (4, 4, 1)),
+    (33, 1, (48, 1, 48), (132, 4, 1)),
+    (1, 3, (70, 70, 1), (4, 4, 1)),
+]
+
+
+@pytest.mark.parametrize("channels,count,strides,expected", STATE_LAYOUT_CASES)
+def test_actual_wrapper_state_layout_uses_only_live_storage(channels, count, strides, expected):
+    call, launches, torch = wrapper()
+    raw = Tensor((1, channels, count), strides)
+    before = (raw.shape, raw.stride(), raw.dtype, copy.deepcopy(raw.device))
+    _, state = call(raw, Tensor((channels, 1, 4)))
+    assert state.stride() == expected
+    assert state.shape == (1, channels, 4)
+    # Singleton strides contribute no storage; every live element is allocated.
+    assert 1 + sum((size - 1) * stride for size, stride in zip(state.shape, state.stride())) == 4 * channels
+    assert launches[0][1][13:15] == expected[1:]
+    assert (raw.shape, raw.stride(), raw.dtype, raw.device) == before
+    if count >= 4:
+        assert [(kind, t.device.type) for kind, t in torch.allocations] == [
+            ("empty_strided", "meta"), ("clone", "meta"), ("clone", "meta"),
+            ("empty_strided", "cuda"), ("empty", "cuda"),
+        ]
+        assert torch.allocations[3][1] is state
+    else:
+        assert [(kind, t.device.type) for kind, t in torch.allocations] == [
+            ("empty", "cuda"), ("empty", "cuda"),
+        ]
+
+
+@pytest.mark.parametrize("count", [33, 8192])
+def test_regression_distinguishes_direct_tail_allocation(count):
+    raw = Tensor((1, 10240, count), (count * 16384, 1, 16384))
+    assert clone_strides(raw[:, :, -4:]) == (40960, 1, 10240)
+    call, _, _ = wrapper()
+    _, state = call(raw, Tensor((10240, 1, 4)))
+    assert state.stride() == (count * 10240, 1, 10240)
+
+
+@pytest.mark.parametrize("channels,count,strides,expected", STATE_LAYOUT_CASES)
+def test_optional_torch_meta_state_matches_native_padding_clone(channels, count, strides, expected):
+    torch = pytest.importorskip("torch")
+    # Pending in the no-Torch control environment; no CUDA or Triton needed.
+    raw = torch.empty_strided((1, channels, count), strides, dtype=torch.bfloat16, device="meta")
+    reference = torch.nn.functional.pad(raw, (max(0, 4 - count), 0))[:, :, -4:].clone()
+    ns = {"torch": torch}
+    execute([next(n for n in nodes("_triton_conv.py") if getattr(n, "name", None) == "_fresh_state")], ns)
+    actual = (ns["_fresh_state"](raw) if count >= 4 else
+              torch.empty((1, channels, 4), dtype=raw.dtype, device=raw.device))
+    assert actual.shape == reference.shape == (1, channels, 4)
+    assert actual.stride() == reference.stride() == expected
+    assert actual.untyped_storage().nbytes() == reference.untyped_storage().nbytes() == 8 * channels
 
 
 @pytest.mark.parametrize("bad", ["cpu", "dtype", "device", "hip", "grad", "stride", "weight", "history", "target"])

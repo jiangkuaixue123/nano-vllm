@@ -65,6 +65,15 @@ def _conv_silu_kernel(X, W, H, S, Y, C: tl.constexpr, T: tl.constexpr,
             tl.store(S + c[:, None] * SC + s[None, :] * SK, tail, c[:, None] < C)
 
 
+def _fresh_state(raw):
+    # Zero padding clones the full raw tensor before slicing its tail. Infer
+    # both clone layouts on Meta so singleton strides survive without copying
+    # or allocating the full prompt on the device. Only four tokens are live.
+    layout = torch.empty_strided(raw.shape, raw.stride(), dtype=raw.dtype, device="meta")
+    layout = layout.clone()[:, :, -4:].clone()
+    return torch.empty_strided(layout.shape, layout.stride(), dtype=raw.dtype, device=raw.device)
+
+
 def causal_conv_silu(raw, weight, history=None, *, state_out=None):
     """Return NCL output and four-entry state; overwrite only supplied state_out.
 
@@ -89,9 +98,8 @@ def causal_conv_silu(raw, weight, history=None, *, state_out=None):
     if torch.is_grad_enabled() or any(s <= 0 for t in tensors for s in t.stride()):
         raise ValueError("Triton GDN convolution requires inference mode and positive strides")
     if state_out is None:
-        # Match window.clone()'s preserved stride ordering, including split
-        # projection views. Positive padding and cached cat use dense NCL.
-        state_out = (torch.empty_like(raw[:, :, -4:]) if history is None and count >= 4 else
+        # Positive padding and cached cat use dense NCL.
+        state_out = (_fresh_state(raw) if history is None and count >= 4 else
                      torch.empty((1, channels, 4), dtype=raw.dtype, device=raw.device))
     output = torch.empty(raw.shape, dtype=raw.dtype, device=raw.device)
     history_strides = history.stride()[1:] if history is not None else (0, 0)

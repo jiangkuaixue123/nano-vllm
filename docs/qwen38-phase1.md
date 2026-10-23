@@ -172,6 +172,15 @@ input and shifts the window. Buffered state keeps its addresses; unbuffered
 state uses new storage with the native stride ordering. Output remains NCL
 before the existing transpose and Q/K/V split.
 
+For unbuffered fresh inputs with at least four tokens, state allocation follows
+the native zero-padding clone, tail slice, and final clone. A Meta descriptor
+executes both clone stages to preserve singleton strides; only the four-token
+state receives device storage. This follows PyTorch's
+[padding and clone allocation rules](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/aten/src/ATen/native/PadNd.cpp)
+and [native clone implementation](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/aten/src/ATen/native/TensorFactories.cpp).
+Meta copies are ignored and its allocator returns null storage pointers;
+CUDA runtime layout and whole-path overhead still require validation.
+
 Each convolution accumulates in FP32 in tap order with explicit FMA, rounds to
 BF16, then computes SiLU in FP32 and rounds again to BF16. Keeping this boundary
 does not prove bitwise equivalence to a particular Torch/CUDA build: FMA
