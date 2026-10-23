@@ -59,9 +59,9 @@ def _conv_silu_kernel(X, W, H, S, Y, C: tl.constexpr, T: tl.constexpr,
                  (c[:, None] < C) & (t[None, :] < T))
         if tl.program_id(1) == tl.cdiv(T, BT) - 1:
             s = tl.arange(0, 4)
-            source_t = T - 4 + s
-            tail = tl.load(X + c[:, None] * XC + source_t[None, :] * XT,
-                           (c[:, None] < C) & (source_t[None, :] >= 0), other=0)
+            state_t = T - 4 + s
+            tail = tl.load(X + c[:, None] * XC + state_t[None, :] * XT,
+                           (c[:, None] < C) & (state_t[None, :] >= 0), other=0)
             tl.store(S + c[:, None] * SC + s[None, :] * SK, tail, c[:, None] < C)
 
 
