@@ -42,11 +42,15 @@ def test_decode_passes_raw_gates_and_mutable_kv_state(monkeypatch):
     q = torch.randn(1, 1, 2, 128, dtype=torch.bfloat16)
     state = torch.zeros(1, 2, 128, 128)
     a = b = torch.ones(1, 1, 2, dtype=torch.bfloat16)
-    log = bias = torch.ones(2, dtype=torch.bfloat16)
+    log = torch.nn.Parameter(torch.ones(2, dtype=torch.float32))
+    bias = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
 
     def call(**kw):
         assert kw["state"] is state and kw["a"] is a and kw["b"] is b
         assert kw["A_log"].dtype == torch.float32
+        assert not kw["A_log"].requires_grad and not kw["dt_bias"].requires_grad
+        assert kw["A_log"].data_ptr() == log.data_ptr()
+        assert kw["dt_bias"].data_ptr() == bias.data_ptr()
         assert kw["use_qk_l2norm"] and kw["backend"] == "flashinfer"
         kw["state"].add_(1)
         return kw["v"], kw["state"]

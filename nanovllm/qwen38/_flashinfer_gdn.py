@@ -40,7 +40,7 @@ def decode(query, key, value, initial, a_log, a, dt_bias, b):
     # Caller supplies writable request-owned state. This API updates it in place.
     return gated_delta_rule_decode(
         q=query.contiguous(), k=key.contiguous(), v=value.contiguous(),
-        state=initial, A_log=a_log.float(), a=a.contiguous(),
-        dt_bias=dt_bias, b=b.contiguous(), use_qk_l2norm=True,
+        state=initial, A_log=a_log.detach().float(), a=a.contiguous(),
+        dt_bias=dt_bias.detach(), b=b.contiguous(), use_qk_l2norm=True,
         backend="flashinfer",
     )
