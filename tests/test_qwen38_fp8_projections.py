@@ -45,7 +45,7 @@ def test_production_layout_reduces_400_to_256_fp8_linears_and_keeps_exclusions()
             assert isinstance(layer.linear_attn.in_proj_b, torch.nn.Linear)
 
 
-def test_loader_copies_every_original_weight_byte_and_scale_block(tmp_path):
+def loaded_models(tmp_path):
     original = construct().to_empty(device="cpu")
     tensors = {}
     for index, (name, parameter) in enumerate(original.named_parameters()):
@@ -62,6 +62,11 @@ def test_loader_copies_every_original_weight_byte_and_scale_block(tmp_path):
     fuse_fp8_projections(merged)
     merged.to_empty(device="cpu")
     report = load_weights(merged, tmp_path)
+    return original, merged, tensors, report
+
+
+def test_loader_copies_every_original_weight_byte_and_scale_block(tmp_path):
+    original, merged, tensors, report = loaded_models(tmp_path)
     assert report["projection_layout"] == "merged" and report["fp8_linear_modules"] == 8
     assert report["loaded_parameters"] == len(tensors) and report["dequantized"] is False
     ordinary = dict(original.named_parameters())
@@ -110,3 +115,44 @@ def test_one_projection_call_is_split_in_original_output_order(monkeypatch):
     assert calls == [(module, inputs)]
     assert torch.equal(first, output[..., :128])
     assert torch.equal(second, output[..., 128:])
+
+
+def test_real_consumers_keep_prefill_continuation_and_states(monkeypatch, tmp_path):
+    original, merged, _, _ = loaded_models(tmp_path)
+
+    def cpu_projection(self, inputs):
+        # A fixed CPU block oracle isolates consumer layouts from GPU algorithms.
+        # Production FP8Linear continues to reject CPU execution.
+        weight = self.weight.float() * self.weight_scale_inv.repeat_interleave(
+            128, 0
+        ).repeat_interleave(128, 1)
+        return torch.cat([
+            torch.nn.functional.linear(inputs.float(), block).bfloat16()
+            for block in weight.split(128, dim=0)
+        ], dim=-1)
+
+    monkeypatch.setattr(FP8Linear, "forward", cpu_projection)
+    left, right = original.new_state(), merged.new_state()
+    for tokens in ([[1, 3, 7]], [[9]], [[11]]):
+        ids = torch.tensor(tokens, dtype=torch.long)
+        expected, actual = original(ids, left), merged(ids, right)
+        assert torch.isfinite(actual).all() and torch.equal(actual, expected)
+        assert left.length == right.length
+        for a, b in zip(left.layers, right.layers):
+            for name in ("key", "value", "conv", "recurrent"):
+                av, bv = getattr(a, name), getattr(b, name)
+                if av is None:
+                    assert bv is None
+                else:
+                    assert torch.equal(av, bv)
+
+
+def test_late_merged_scale_corruption_rejects_before_any_copy(tmp_path):
+    _, merged, tensors, _ = loaded_models(tmp_path)
+    name = "model.language_model.layers.1.mlp.up_proj.weight_scale_inv"
+    tensors[name][-1, -1] = float("nan")
+    save_file(tensors, tmp_path / "weights.safetensors")
+    before = {name: p.view(torch.uint8).clone() for name, p in merged.named_parameters()}
+    with pytest.raises(ValueError, match="finite and positive"):
+        load_weights(merged, tmp_path)
+    assert all(torch.equal(p.view(torch.uint8), before[name]) for name, p in merged.named_parameters())

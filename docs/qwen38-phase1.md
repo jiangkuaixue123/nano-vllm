@@ -153,7 +153,8 @@ projections before allocation. The default is `separate`. Only complete
 multiplier load directly into the corresponding slice. No weight requantization
 or dense fallback is performed. GDN A/B and the language-model head keep their
 existing BF16 paths. In the supported architecture this reduces FP8 linear
-modules from 400 to 256 and shares the input quantization within each group.
+modules from 400 to 256. The DeepGEMM path quantizes the input once per group;
+the native Triton kernel still quantizes within each output tile.
 
 This follows vLLM's merged projection layout without importing its runtime.
 Larger GEMM output shapes can change floating-point accumulation, so structural
