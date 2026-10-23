@@ -64,21 +64,24 @@ class DecodeGraph:
             (None if l.key is None else l.key.clone(),
              None if l.value is None else l.value.clone(),
              None if l.conv is None else l.conv.clone(),
-             None if l.recurrent is None else l.recurrent.clone())
+             None if l.recurrent is None else l.recurrent.clone(), l.fresh)
             for l in state.layers
         ]
         state.positions = self.pos
         self.ids.fill_(dummy_token)
         self.pos.fill_(self.length)
         with torch.inference_mode():
-            self.model(self.ids, state=state)          # 预热一份，供 capture 前的分配
+            self.model(self.ids, state=state)
+            # Fresh state takes the prefill branch on the first call. Warm the
+            # actual decode branch as well, including optional kernel JIT/load.
+            self.model(self.ids, state=state)
             torch.cuda.synchronize()
             self.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graph, pool=capture_pool(id(self.model))):
                 self.logits = self.model(self.ids, state=state)
         # capture 真实跑了一步，把 KV / 卷积态 / 递推态恢复到抓取前
         with torch.inference_mode():
-            for layer, (k, v, c, r) in zip(state.layers, saved):
+            for layer, (k, v, c, r, fresh) in zip(state.layers, saved):
                 if layer.key is not None and k is not None:
                     layer.key.copy_(k)
                 if layer.value is not None and v is not None:
@@ -87,6 +90,7 @@ class DecodeGraph:
                     layer.conv.copy_(c)
                 if layer.recurrent is not None and r is not None:
                     layer.recurrent.copy_(r)
+                layer.fresh = fresh
         self.pos.fill_(self.length)
         return self
 
