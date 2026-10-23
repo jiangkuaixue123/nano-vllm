@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -314,6 +315,13 @@ class DeltaNet(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.gdn_backend = os.environ.get("NANOVLLM_GDN", "native")
+        if self.gdn_backend not in ("native", "flashinfer"):
+            raise ValueError(f"Unsupported NANOVLLM_GDN: {self.gdn_backend}")
+        if self.gdn_backend == "flashinfer" and (
+            config.linear_key_head_dim != 128 or config.linear_value_head_dim != 128
+        ):
+            raise ValueError("FlashInfer GDN requires the dedicated 128-dimensional heads")
         self.key_dim = config.linear_num_key_heads * config.linear_key_head_dim
         self.value_dim = config.linear_num_value_heads * config.linear_value_head_dim
         conv_dim = 2 * self.key_dim + self.value_dim
@@ -347,8 +355,6 @@ class DeltaNet(nn.Module):
             b_lin, a_lin = self.in_proj_b(x), self.in_proj_a(x)
         raw = qkv_lin.transpose(1, 2)
         gate = z_lin.reshape(1, count, -1, config.linear_value_head_dim)
-        beta = b_lin.sigmoid()
-        decay = -self.A_log.float().exp() * F.softplus(a_lin.float() + self.dt_bias)
         buffered = state.capacity > 0 and state.conv is not None
         previous = state.conv is not None and not state.fresh
         mixed = torch.cat((state.conv, raw), dim=-1) if previous else raw
@@ -376,9 +382,26 @@ class DeltaNet(nn.Module):
             query.repeat_interleave(repeats, 2),
             key.repeat_interleave(repeats, 2),
         )
-        operation = recurrent_delta if previous and count == 1 else chunk_delta
         current = None if state.fresh else state.recurrent
-        output, updated = operation(query, key, value, decay, beta, current)
+        if self.gdn_backend == "flashinfer":
+            from . import _flashinfer_gdn
+
+            if previous and count == 1:
+                output, updated = _flashinfer_gdn.decode(
+                    query, key, value, current if buffered else current.clone(),
+                    self.A_log, a_lin, self.dt_bias, b_lin
+                )
+            else:
+                beta = b_lin.sigmoid()
+                decay = -self.A_log.float().exp() * F.softplus(a_lin.float() + self.dt_bias)
+                output, updated = _flashinfer_gdn.prefill(
+                    query, key, value, decay, beta, current
+                )
+        else:
+            beta = b_lin.sigmoid()
+            decay = -self.A_log.float().exp() * F.softplus(a_lin.float() + self.dt_bias)
+            operation = recurrent_delta if previous and count == 1 else chunk_delta
+            output, updated = operation(query, key, value, decay, beta, current)
         if buffered:
             state.recurrent.copy_(updated)
         else:

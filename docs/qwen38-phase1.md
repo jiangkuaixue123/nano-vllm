@@ -128,3 +128,19 @@ decode stays in that capacity through the context limit, avoiding the default
 bucket policy's mid-request eager demotion. The default remains `buckets`.
 This can increase resident KV memory and masked-attention work for short inputs.
 GPU numerical behavior and end-to-end effect require separate validation.
+
+### FlashInfer GDN (experimental)
+
+`NANOVLLM_GDN=flashinfer` selects FlashInfer GDN prefill and single-token decode
+for the dedicated 128-dimensional heads. The default remains `native` and an
+explicit request fails if the optional backend is unavailable. This uses the
+installed FlashInfer operator package without importing the vLLM runtime.
+Prefill follows the normalization/decay API used by vLLM 0.32 and transposes
+the operator's V,K state to the engine's K,V layout. Recurrent state stays FP32;
+buffered decode updates fixed storage in place, while unbuffered decode copies
+state to preserve the transactional model call.
+
+This changes numerical rounding: prefill normalized Q/K are rounded to the
+activation dtype, and fused decode computes gates in FP32 without the native
+BF16 sigmoid intermediate. Operator, Graph, full-model quality and end-to-end
+qualification are required; enabling it is not a quality or parity claim.
