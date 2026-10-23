@@ -97,7 +97,7 @@ The model math is derived from the Apache-2.0 Transformers Qwen3.5 source.
 See [NOTICE-qwen38](../NOTICE-qwen38) and [Apache license](../LICENSES/Apache-2.0.txt).
 The original nano-vllm code retains its [MIT license](../LICENSE).
 
-## Optional small-M FP8 GEMM
+## Optional FP8 GEMM backends
 
 `NANOVLLM_FP8_GEMM=flashinfer` selects FlashInfer's SM90 block-scaled
 FP8 GEMM for fewer than 32 activation rows, including single-token decoding.
@@ -111,3 +111,10 @@ The loader reports this mixed backend, and provenance separates FlashInfer and
 Triton Python call counts. These counts include warmup/capture and exclude CUDA
 Graph replay. Selecting the backend does not establish model quality or service
 performance; those require the governing acceptance campaign's evidence.
+
+`NANOVLLM_FP8_GEMM=flashinfer_deepgemm` additionally uses an independently
+installed `deep_gemm` package for M>=32 prefill. It keeps the same FlashInfer
+decode path. Activation quantization uses the existing block-128 FP8 semantics
+and produces TMA-aligned FP32 scales; the GEMM explicitly disables UE8M0 casting.
+Official checkpoint weight bytes and multipliers remain unchanged. This mode
+does not import the vLLM runtime and fails if DeepGEMM is unavailable.

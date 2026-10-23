@@ -166,7 +166,7 @@ class DedicatedEngine:
                     origins[name] = {"path": str(Path(path).resolve()),
                                      "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
         versions = {name: str(getattr(sys.modules[name], "__version__", "unknown"))
-                    for name in ("torch", "transformers", "triton", "flashinfer") if name in sys.modules}
+                    for name in ("torch", "transformers", "triton", "flashinfer", "deep_gemm") if name in sys.modules}
         device = {"device_type": "synthetic", "device_count": 0, "device_model": "test_only"}
         if self.loader_report["dtype"] != "test_only":
             import torch
@@ -186,7 +186,7 @@ class DedicatedEngine:
                          "kernel_name": self.loader_report["kernel_name"],
                          "executed_modules": sum(count > 0 for count in calls.values()), "per_module_calls": calls,
                          "kernel_calls": {kernel: sum(module.kernel_calls[kernel] for module in modules.values())
-                                          for kernel in ("flashinfer", "triton")},
+                                          for kernel in ("flashinfer", "triton", "deepgemm")},
                          "weight_dtype": "float8_e4m3fn", "scale_dtype": "float32",
                          "actual_dtypes_valid": all(module.weight.dtype == torch.float8_e4m3fn
                                                     and module.weight_scale_inv.dtype == torch.float32
