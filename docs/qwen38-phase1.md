@@ -156,6 +156,40 @@ provenance, records the constructed backend, Q/K layout and head counts. CPU
 mock tests cover routing and state layout; GPU operator and matched end-to-end
 qualification are still required for this option.
 
+### Fused GDN convolution and SiLU (experimental)
+
+`NANOVLLM_GDN_CONV=triton` selects a lazy-loaded CUDA BF16 implementation for
+fresh prefill and cached single-token decode. The default remains `native`.
+This option requires a four-tap kernel; cached multi-token continuation keeps
+the native computation. Unknown selections and unsupported CUDA tensor
+contracts fail explicitly. The loader and health provenance expose the
+constructed `gdn_convolution` backend and its execution scope.
+
+The kernel reads projection views directly and retains the four-entry request
+window. Fresh calls ignore stale state, left-pad short inputs with zeros, and
+save the final four inputs. Decode consumes history entries 1–3 plus the new
+input and shifts the window. Buffered state keeps its addresses; unbuffered
+state uses new storage with the native stride ordering. Output remains NCL
+before the existing transpose and Q/K/V split.
+
+For unbuffered fresh inputs with at least four tokens, state allocation follows
+the native zero-padding clone, tail slice, and final clone. A Meta descriptor
+executes both clone stages to preserve singleton strides; only the four-token
+state receives device storage. This follows PyTorch's
+[padding and clone allocation rules](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/aten/src/ATen/native/PadNd.cpp)
+and [native clone implementation](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/aten/src/ATen/native/TensorFactories.cpp).
+Meta copies are ignored and its allocator returns null storage pointers;
+CUDA runtime layout and whole-path overhead still require validation.
+
+Each convolution accumulates in FP32 in tap order with explicit FMA, rounds to
+BF16, then computes SiLU in FP32 and rounds again to BF16. Keeping this boundary
+does not prove bitwise equivalence to a particular Torch/CUDA build: FMA
+contraction, exp/div lowering and subnormal handling require GPU observation.
+The opt-in probe `tests/qwen38_conv_probe.py` records bit differences, numerical
+errors, state ownership/layout and Graph replay; it defines no tolerance or
+quality/performance acceptance. Full-model and service validation remain
+separate. Quantization, attention and GDN recurrence are unchanged.
+
 ### Merged FP8 projections (experimental)
 
 `NANOVLLM_FP8_PROJECTIONS=merged` combines gate/up, Q/K/V and GDN QKV/Z
