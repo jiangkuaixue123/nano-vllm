@@ -237,3 +237,89 @@ def test_decode_exception_and_interrupt_release_temporary_requests():
     with pytest.raises(KeyboardInterrupt):
         engine.prefill("interrupted", [1])
     assert not engine.active_request_ids
+
+
+def test_invalid_graph_policy_fails_explicitly(monkeypatch):
+    monkeypatch.setenv("NANOVLLM_CUDA_GRAPH_POLICY", "unknown")
+    with pytest.raises(ValueError, match="NANOVLLM_CUDA_GRAPH_POLICY"):
+        runner()
+
+
+def test_full_context_graph_covers_long_decode_and_reuses_state(monkeypatch):
+    from types import SimpleNamespace
+
+    class GraphModel(NativeModel):
+        def new_state(self, capacity=None):
+            return {"tokens": [], "capacity": capacity}
+
+    class FakeGraph:
+        BUCKETS = (256, 1024, 2048, 4096, 8448)
+
+        @classmethod
+        def bucket_for(cls, needed):
+            return next((b for b in cls.BUCKETS if needed <= b), None)
+
+        def __init__(self, model, state, length, capacity):
+            self.model, self.state = model, state
+            self.capacity, self.steps = capacity, []
+            self.length = length
+
+        def capture(self):
+            assert self.length < self.capacity
+            return self
+
+        def reset_request_state(self):
+            self.state["tokens"].clear()
+            return self.state
+
+        def step(self, token, position):
+            assert position < self.capacity
+            self.steps.append(position)
+            return self.model([[token]], state=self.state)
+
+    monkeypatch.setattr(MODULE, "__package__", "graph_policy_test")
+    monkeypatch.setattr(MODULE, "__spec__", importlib.util.spec_from_loader("graph_policy_test.runner", loader=None))
+    monkeypatch.setitem(sys.modules, "graph_policy_test.graph", SimpleNamespace(DecodeGraph=FakeGraph))
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=SimpleNamespace(memory_allocated=lambda: 0)))
+    monkeypatch.setenv("NANOVLLM_CUDA_GRAPH", "1")
+    monkeypatch.setenv("NANOVLLM_CUDA_GRAPH_POLICY", "full_context")
+    engine = RequestRunner(GraphModel(), tensor_factory=lambda value: value,
+                           max_context_tokens=10240, vocab_size=8)
+    report = engine.prewarm_graphs()
+    assert report["policy"] == "full_context"
+    assert set(report["buckets"]) == {10240}
+    graph = engine._graph_pool[10240]
+    engine.prefill("long", [1] * 8192)
+    for _ in range(2048):
+        engine.append("long", [2])
+    assert graph.steps == list(range(8192, 10240))
+    assert engine._requests["long"].graph is graph
+    assert engine.release("long")
+    engine.prefill("next", [3])
+    assert engine._requests["next"].graph is graph
+    assert graph.state["tokens"] == [3]
+    engine.release("next")
+    assert not engine._graph_busy and not engine.active_request_ids
+
+    # A direct prefill can fill the entire context before any graph is warmed.
+    unprimed = RequestRunner(GraphModel(), tensor_factory=lambda value: value,
+                            max_context_tokens=4, vocab_size=8)
+    unprimed.prefill("full", [1] * 4)
+    assert unprimed._requests["full"].graph is None
+    with pytest.raises(ValueError, match="max_context_tokens"):
+        unprimed.append("full", [1])
+    assert not unprimed.active_request_ids and not unprimed._graph_busy
+
+    # Existing default selection and headroom remain unchanged.
+    monkeypatch.delenv("NANOVLLM_CUDA_GRAPH_POLICY")
+    default = RequestRunner(GraphModel(), max_context_tokens=10240)
+    assert default._graph_capacities() == FakeGraph.BUCKETS
+    assert default._graph_capacity_for(8192) == 8448
+    assert default._graph_capacity_for(10000) is None
+
+
+def test_full_context_graph_rejects_concurrent_admission(monkeypatch):
+    monkeypatch.setenv("NANOVLLM_CUDA_GRAPH", "1")
+    monkeypatch.setenv("NANOVLLM_CUDA_GRAPH_POLICY", "full_context")
+    with pytest.raises(ValueError, match="max_active_requests=1"):
+        runner(max_active_requests=2)

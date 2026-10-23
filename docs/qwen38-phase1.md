@@ -111,3 +111,13 @@ The loader reports this mixed backend, and provenance separates FlashInfer and
 Triton Python call counts. These counts include warmup/capture and exclude CUDA
 Graph replay. Selecting the backend does not establish model quality or service
 performance; those require the governing acceptance campaign's evidence.
+
+### Full-context decode graph (experimental)
+
+With CUDA Graph enabled, `NANOVLLM_CUDA_GRAPH_POLICY=full_context` reserves and
+prewarms one graph at the configured `max_context_tokens`. This policy requires
+`max_active_requests=1`. Admitted single-token
+decode stays in that capacity through the context limit, avoiding the default
+bucket policy's mid-request eager demotion. The default remains `buckets`.
+This can increase resident KV memory and masked-attention work for short inputs.
+GPU numerical behavior and end-to-end effect require separate validation.

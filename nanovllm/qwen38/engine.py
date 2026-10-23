@@ -44,7 +44,7 @@ class DedicatedEngine:
             raise ValueError("max_context_tokens exceeds model context limit")
         runner = RequestRunner(native, tokenizer, max_context_tokens=max_context_tokens,
                                max_active_requests=max_active_requests, vocab_size=native.config.vocab_size)
-        # 桶预热：把 5 个桶在启动时各抓一遍，capture 成本计入 startup，不进 TTFT。
+        # Prewarm the selected graph capacities; capture is startup, not TTFT.
         self.prewarm_report = runner.prewarm_graphs() if runner.graph_enabled else {}
         model_id = "Qwen/Qwen3.8-27B-FP8" if report["dtype"] == "fp8" else "Qwen/Qwen3.8-27B"
         self._initialize(runner, eos, model_id, report)
