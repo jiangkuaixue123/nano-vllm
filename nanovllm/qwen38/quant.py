@@ -24,15 +24,19 @@ class FP8Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, *, device=None):
         super().__init__()
         requested = os.environ.get("NANOVLLM_FP8_GEMM", "triton")
-        if requested not in ("triton", self.backend, "flashinfer"):
+        if requested not in ("triton", self.backend, "flashinfer", "flashinfer_deepgemm"):
             raise ValueError(
                 f"Unsupported NANOVLLM_FP8_GEMM={requested!r}; this build implements "
-                "triton and flashinfer (small-M only). No fallback was selected."
+                "triton, flashinfer and flashinfer_deepgemm. No fallback was selected."
             )
-        self.use_flashinfer = requested == "flashinfer"
+        self.use_flashinfer = requested in ("flashinfer", "flashinfer_deepgemm")
+        self.use_deepgemm = requested == "flashinfer_deepgemm"
         if self.use_flashinfer:
             self.backend = "flashinfer_small_m_triton_prefill"
             self.kernel_name = "fp8_blockscale_gemm_sm90+qwen38_block_fp8"
+        if self.use_deepgemm:
+            self.backend = "flashinfer_small_m_deepgemm_prefill"
+            self.kernel_name = "fp8_blockscale_gemm_sm90+deep_gemm.fp8_gemm_nt"
         if in_features <= 0 or out_features <= 0:
             raise ValueError("FP8 linear dimensions must be positive")
         self.in_features = in_features
@@ -45,7 +49,7 @@ class FP8Linear(nn.Module):
             device=device, dtype=torch.float32,
         ), requires_grad=False)
         self.native_fp8_calls = 0
-        self.kernel_calls = {"flashinfer": 0, "triton": 0}
+        self.kernel_calls = {"flashinfer": 0, "triton": 0, "deepgemm": 0}
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         if inputs.ndim < 2 or inputs.shape[-1] != self.in_features or inputs.numel() == 0:
@@ -74,6 +78,13 @@ class FP8Linear(nn.Module):
                 weight_scale=self.weight_scale_inv, out_dtype=torch.bfloat16,
             ).reshape(*inputs.shape[:-1], self.out_features)
             self.kernel_calls["flashinfer"] += 1
+        elif self.use_deepgemm:
+            from ._deepgemm_fp8 import matmul
+
+            result = matmul(inputs.reshape(rows, self.in_features).contiguous(),
+                            self.weight, self.weight_scale_inv)
+            result = result.reshape(*inputs.shape[:-1], self.out_features)
+            self.kernel_calls["deepgemm"] += 1
         else:
             from ._triton_fp8 import matmul
 
