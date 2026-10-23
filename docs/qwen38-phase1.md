@@ -118,3 +118,13 @@ decode path. Activation quantization uses the existing block-128 FP8 semantics
 and produces TMA-aligned FP32 scales; the GEMM explicitly disables UE8M0 casting.
 Official checkpoint weight bytes and multipliers remain unchanged. This mode
 does not import the vLLM runtime and fails if DeepGEMM is unavailable.
+
+### Full-context decode graph (experimental)
+
+With CUDA Graph enabled, `NANOVLLM_CUDA_GRAPH_POLICY=full_context` reserves and
+prewarms one graph at the configured `max_context_tokens`. This policy requires
+`max_active_requests=1`. Admitted single-token
+decode stays in that capacity through the context limit, avoiding the default
+bucket policy's mid-request eager demotion. The default remains `buckets`.
+This can increase resident KV memory and masked-attention work for short inputs.
+GPU numerical behavior and end-to-end effect require separate validation.

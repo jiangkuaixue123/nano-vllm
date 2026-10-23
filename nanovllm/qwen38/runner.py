@@ -42,6 +42,11 @@ class RequestRunner:
         self._requests: dict[str, _Request] = {}
         # CUDA Graph 解码：按 bucket 缓存图并复用，抓一次摊到后续所有请求上。
         self.graph_enabled = os.environ.get("NANOVLLM_CUDA_GRAPH") == "1"
+        self.graph_policy = os.environ.get("NANOVLLM_CUDA_GRAPH_POLICY", "buckets")
+        if self.graph_policy not in ("buckets", "full_context"):
+            raise ValueError("NANOVLLM_CUDA_GRAPH_POLICY must be buckets or full_context")
+        if self.graph_enabled and self.graph_policy == "full_context" and max_active_requests != 1:
+            raise ValueError("full_context graphs require max_active_requests=1")
         self.graph_headroom = 256
         self._graph_pool: dict[int, object] = {}
         self._graph_busy: set[int] = set()
@@ -73,6 +78,20 @@ class RequestRunner:
 
         return torch.tensor([tokens], dtype=torch.long, device=self.device), torch.inference_mode()
 
+    def _graph_capacities(self):
+        if self.graph_policy == "full_context":
+            return (self.max_context_tokens,)
+        from .graph import DecodeGraph
+
+        return DecodeGraph.BUCKETS
+
+    def _graph_capacity_for(self, prompt_length):
+        if self.graph_policy == "full_context":
+            return self.max_context_tokens
+        from .graph import DecodeGraph
+
+        return DecodeGraph.bucket_for(prompt_length + self.graph_headroom)
+
     def prewarm_graphs(self):
         """启动时把所有桶各抓一遍，capture 成本计入 startup，不进 TTFT。
 
@@ -86,9 +105,9 @@ class RequestRunner:
 
         from .graph import DecodeGraph
 
-        report = {"buckets": {}, "started_unix": time.time()}
+        report = {"policy": self.graph_policy, "buckets": {}, "started_unix": time.time()}
         before_all = torch.cuda.memory_allocated()
-        for capacity in DecodeGraph.BUCKETS:
+        for capacity in self._graph_capacities():
             if capacity in self._graph_pool:
                 continue
             before = torch.cuda.memory_allocated()
@@ -139,9 +158,7 @@ class RequestRunner:
             raise ValueError("active request capacity exhausted")
         capacity = None
         if self.graph_enabled:
-            from .graph import DecodeGraph
-
-            capacity = DecodeGraph.bucket_for(len(tokens) + self.graph_headroom)
+            capacity = self._graph_capacity_for(len(tokens))
         request = _Request(self.model.new_state())
         pooled = None
         if capacity:
@@ -152,7 +169,6 @@ class RequestRunner:
                 # 复用同一 bucket 的图：把它的 state 清成新请求状态后重新 prefill。
                 request.state = pooled.reset_request_state()
             else:
-                capacity = DecodeGraph.bucket_for(len(tokens) + self.graph_headroom)
                 request.state = self.model.new_state(capacity=capacity)
         self._requests[request_id] = request
         try:
@@ -163,7 +179,7 @@ class RequestRunner:
         except BaseException:
             self._release_graph(request)
             raise
-        if capacity and request.graph is None:
+        if capacity and request.graph is None and request.length < capacity:
             from .graph import DecodeGraph
 
             graph = DecodeGraph(self.model, request.state, request.length,
