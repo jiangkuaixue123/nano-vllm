@@ -44,10 +44,19 @@ def cases():
             torch.int16,
         ).view(torch.bfloat16).reshape(shape)
 
-    q = bit_values((1, 24, 64, 256))
-    k = bit_values((1, 4, 64, 256))
+    def rope_bit_values(heads):
+        # Each rotary half independently contains all 65,536 words, even for
+        # four K heads: 4 * 512 * 32 == 65,536. Sequential full-width rows would
+        # instead hide three quarters of the words (including Inf/NaN) in tails.
+        first = bit_values((1, heads, 512, 32))
+        second = first.flip((-1,)).contiguous()
+        tail = bit_values((1, heads, 512, 192))
+        return torch.cat((first, second, tail), dim=-1)
+
+    q = rope_bit_values(24)
+    k = rope_bit_values(4)
     for cosine, sine in ((1.0, 0.0), (0.0, -0.0), (0.70703125, 0.70703125), (-1.0, 1.0)):
-        c = torch.full((1, 1, 64, 64), cosine, device="cuda", dtype=torch.bfloat16)
+        c = torch.full((1, 1, 512, 64), cosine, device="cuda", dtype=torch.bfloat16)
         s = torch.full_like(c, sine)
         yield f"all-bf16-inputs-{cosine}-{sine}", (q, k, c, s)
     c = bit_values((1, 1, 1024, 64))
