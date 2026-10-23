@@ -152,6 +152,10 @@ def test_late_merged_scale_corruption_rejects_before_any_copy(tmp_path):
     name = "model.language_model.layers.1.mlp.up_proj.weight_scale_inv"
     tensors[name][-1, -1] = float("nan")
     save_file(tensors, tmp_path / "weights.safetensors")
+    with torch.no_grad():
+        # Source values are positive. Any premature copy must change the sentinel.
+        for parameter in merged.parameters():
+            parameter.zero_()
     before = {name: p.view(torch.uint8).clone() for name, p in merged.named_parameters()}
     with pytest.raises(ValueError, match="finite and positive"):
         load_weights(merged, tmp_path)
