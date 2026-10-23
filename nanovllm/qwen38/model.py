@@ -447,6 +447,9 @@ class DeltaNet(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.activation_backend = os.environ.get("NANOVLLM_MLP_ACTIVATION", "native")
+        if self.activation_backend not in ("native", "triton"):
+            raise ValueError(f"Unsupported NANOVLLM_MLP_ACTIVATION: {self.activation_backend}")
         self.gate_proj = nn.Linear(
             config.hidden_size, config.intermediate_size, bias=False
         )
@@ -473,6 +476,12 @@ class MLP(nn.Module):
             gate, up = self.gate_up_proj(x)
         else:
             gate, up = self.gate_proj(x), self.up_proj(x)
+        if self.activation_backend == "triton":
+            if gate.device.type != "cuda" or torch.version.hip is not None:
+                raise ValueError("Triton MLP activation requires NVIDIA CUDA")
+            from ._triton_silu import silu_and_mul
+
+            return self.down_proj(silu_and_mul(gate, up))
         return self.down_proj(F.silu(gate) * up)
 
 

@@ -207,3 +207,27 @@ This avoids projecting unused prompt positions, following the selected-hidden-ro
 approach used by vLLM before its logits processor. A different GEMM row count can
 change accumulation; CPU tests do not establish production token equality,
 task quality or end-to-end speedup. Those remain GPU validation requirements.
+
+## Optional fused MLP activation
+
+`NANOVLLM_MLP_ACTIVATION=triton` selects a standalone CUDA BF16 kernel for the
+MLP's `F.silu(gate) * up` expression. The default `native` path is unchanged.
+Unknown values fail at construction; the fused path rejects non-NVIDIA devices,
+non-BF16 operands and tensors requiring gradients. It reads the gate/up split
+views of merged FP8 projections directly, using each tensor's strides and masked
+tails, and returns a fresh contiguous tensor for the unchanged down projection.
+
+The kernel computes SiLU in FP32 using CUDA libdevice exponential and precise
+division, rounds the SiLU result to BF16, then multiplies by up and rounds again.
+The intermediate BF16 rounding is part of the contract even though its memory
+allocation is removed. Floating-point fusion is disabled. This does not prove
+bitwise agreement with every Torch/CUDA compiler build: exponential lowering,
+subnormals and division must still be checked on the target GPU.
+
+The loader's `mlp_activation` report records the constructed backend and layer
+count. `tests/qwen38_mlp_silu_probe.py` is an explicit CUDA probe, outside default
+pytest discovery; it covers all BF16 gate bit patterns, representative up
+values, production merged views, arbitrary positive strides and masked tails.
+It requires exact finite-result bits and matching nonfinite classifications;
+no numerical tolerance is substituted. Operator success alone establishes no
+model quality, Graph-state parity or service-performance result.
