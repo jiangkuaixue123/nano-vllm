@@ -126,7 +126,7 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     report = {"loaded_parameters": len(mapped), "excluded_tensors": skipped,
               "scope": "text_only", "dtype": "bfloat16"}
     if fp8_modules:
-        report.update(fp8_report(len(fp8_modules)))
+        report.update(fp8_report(fp8_modules.values()))
     return report
 
 

@@ -24,11 +24,15 @@ class FP8Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, *, device=None):
         super().__init__()
         requested = os.environ.get("NANOVLLM_FP8_GEMM", "triton")
-        if requested not in ("triton", self.backend):
+        if requested not in ("triton", self.backend, "flashinfer"):
             raise ValueError(
                 f"Unsupported NANOVLLM_FP8_GEMM={requested!r}; this build implements "
-                f"only {self.backend}. No fallback was selected."
+                "triton and flashinfer (small-M only). No fallback was selected."
             )
+        self.use_flashinfer = requested == "flashinfer"
+        if self.use_flashinfer:
+            self.backend = "flashinfer_small_m_triton_prefill"
+            self.kernel_name = "fp8_blockscale_gemm_sm90+qwen38_block_fp8"
         if in_features <= 0 or out_features <= 0:
             raise ValueError("FP8 linear dimensions must be positive")
         self.in_features = in_features
@@ -41,6 +45,7 @@ class FP8Linear(nn.Module):
             device=device, dtype=torch.float32,
         ), requires_grad=False)
         self.native_fp8_calls = 0
+        self.kernel_calls = {"flashinfer": 0, "triton": 0}
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         if inputs.ndim < 2 or inputs.shape[-1] != self.in_features or inputs.numel() == 0:
@@ -51,10 +56,29 @@ class FP8Linear(nn.Module):
             raise ValueError("Native FP8 execution requires colocated CUDA tensors")
         if torch.cuda.get_device_capability(inputs.device) != (9, 0):
             raise ValueError("Dedicated FP8 kernel requires SM90")
-        from ._triton_fp8 import matmul
-
-        result = matmul(inputs.contiguous(), self.weight, self.weight_scale_inv)
+        result = self._matmul(inputs)
         self.native_fp8_calls += 1
+        return result
+
+    def _matmul(self, inputs: torch.Tensor) -> torch.Tensor:
+        # Match vLLM's small-M SM90 choice. Large prefill keeps the existing
+        # kernel; FlashInfer's BF16 input path quantizes activations internally.
+        rows = inputs.numel() // self.in_features
+        if self.use_flashinfer and rows < 32:
+            if self.in_features % 128 or self.out_features % 64:
+                raise ValueError("FlashInfer FP8 requires K divisible by 128 and N by 64")
+            from flashinfer.gemm import fp8_blockscale_gemm_sm90
+
+            result = fp8_blockscale_gemm_sm90(
+                inputs.reshape(rows, self.in_features).contiguous(), self.weight,
+                weight_scale=self.weight_scale_inv, out_dtype=torch.bfloat16,
+            ).reshape(*inputs.shape[:-1], self.out_features)
+            self.kernel_calls["flashinfer"] += 1
+        else:
+            from ._triton_fp8 import matmul
+
+            result = matmul(inputs.contiguous(), self.weight, self.weight_scale_inv)
+            self.kernel_calls["triton"] += 1
         return result
 
 
@@ -93,12 +117,17 @@ def convert_fp8_linears(model: nn.Module, exclusions: tuple[str, ...]) -> int:
     return len(selected)
 
 
-def fp8_report(count: int) -> dict:
+def fp8_report(modules) -> dict:
+    modules = tuple(modules)
+    backends = {(module.backend, module.kernel_name) for module in modules}
+    if len(backends) != 1:
+        raise ValueError("FP8 loading requires one consistent backend selection")
+    backend, kernel_name = next(iter(backends))
     return {
         "dtype": "fp8", "activation_dtype": "bfloat16",
         "weight_dtype": "float8_e4m3fn", "scale_dtype": "float32",
         "checkpoint_scale_dtype": "bfloat16", "quantization": dict(FP8_QUANTIZATION),
-        "execution": "native_fp8", "fp8_linear_modules": count,
-        "dequantized": False, "backend": FP8Linear.backend,
-        "kernel_name": FP8Linear.kernel_name,
+        "execution": "native_fp8", "fp8_linear_modules": len(modules),
+        "dequantized": False, "backend": backend,
+        "kernel_name": kernel_name,
     }
