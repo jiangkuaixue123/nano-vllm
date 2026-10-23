@@ -35,9 +35,12 @@ def _paired_rope_kernel(
         K + head * KH + token * KT + partner_dim * KD,
     )
     partner = tl.load(partner_source, rotate, other=0).to(tl.float32)
-    # Native constructs [-second, first] before multiplying. Preserve signed
-    # zero and the sign operation rather than rewriting this as subtraction.
-    signed_partner = tl.where(dim < 32, -partner, partner)
+    # Flip the FP32 sign bit: unary minus can lower to +0 - partner, which
+    # loses -0 when partner is +0. Keep the native [-second, first] semantics.
+    neg_partner = (partner.to(tl.uint32, bitcast=True) ^ 0x80000000).to(
+        tl.float32, bitcast=True,
+    )
+    signed_partner = tl.where(dim < 32, neg_partner, partner)
     cosine = tl.load(C + token * CT + dim * CD, rotate, other=0).to(tl.float32)
     sine = tl.load(S + token * ST + dim * SD, rotate, other=0).to(tl.float32)
     product1 = (value.to(tl.float32) * cosine).to(tl.bfloat16, fp_downcast_rounding="rtne")

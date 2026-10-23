@@ -6,6 +6,7 @@ Optional captured operands must be trusted task-owned tensor dictionaries.
 
 import argparse
 import json
+from itertools import product
 from pathlib import Path
 
 import torch
@@ -13,6 +14,26 @@ import torch
 from nanovllm.qwen38._triton_rope import paired_partial_rope
 from nanovllm.qwen38.config import Qwen38TextConfig
 from nanovllm.qwen38.model import apply_rope, rotary_tables
+
+
+def directed_zero_cases():
+    """Joint operands omitted by individual-word coverage; not exhaustive RoPE."""
+    zeros = (0x0000, 0x8000)
+    units = (0x3F80, 0xBF80)
+    table_words = zeros + units
+    for label, first_words in (("zero-halves", zeros), ("unit-first-zero-partner", units)):
+        rows = list(product(first_words, zeros, table_words, table_words))
+        values = torch.tensor(rows, dtype=torch.int32, device="cuda").to(torch.int16).view(torch.bfloat16)
+        tokens = len(rows)
+        q = torch.zeros((1, 24, tokens, 256), dtype=torch.bfloat16, device="cuda")
+        k = torch.zeros((1, 4, tokens, 256), dtype=torch.bfloat16, device="cuda")
+        for x in (q, k):
+            x[..., :32] = values[:, 0, None]
+            x[..., 32:64] = values[:, 1, None]
+            x[..., 64::2] = -0.0
+        c = values[:, 2, None].expand(tokens, 64)[None, None]
+        s = values[:, 3, None].expand(tokens, 64)[None, None]
+        yield f"directed-joint-{label}", (q, k, c, s)
 
 
 def cases():
@@ -68,6 +89,7 @@ def cases():
     q[..., :32] = k[..., :32] = 1.0078125
     c = torch.full((1, 1, 1, 64), 0.70703125, device="cuda", dtype=torch.bfloat16)
     yield "two-product-rounding-cancellation", (q, k, c, c.clone())
+    yield from directed_zero_cases()
 
 
 def check(operands):
