@@ -304,3 +304,32 @@ shapes, tails, exceptional BF16 values and input immutability. Repeated
 Finite outputs require exact bits, including signed zero; nonfinite classifications
 must match. Failures are retained and no tolerance is substituted. Actual full-model
 outputs, complete Graph state and service performance require separate validation.
+
+## Optional paired partial RoPE
+
+`NANOVLLM_FULL_ROPE=triton` replaces only the two post-normalization Q/K
+partial-RoPE expressions with one pointwise CUDA kernel. The default `native`
+expression is unchanged. Selection is bound when each full-attention layer is
+constructed; health provenance reports `full_attention_rope` with the backend,
+layer count and scope. Q/K normalization, cached zero-centered weights, gate
+materialization, V, rotary-table generation, positions and KV writes keep their
+existing paths. Unsupported option values fail explicitly.
+
+The opt-in accepts the production BF16 shapes: Q `[1,24,T,256]`, K
+`[1,4,T,256]`, and cos/sin `[1,1,T,64]`. It reads independent nonnegative
+strides, including transposed postnorm views, offsets and broadcast dimensions,
+and returns fresh contiguous outputs. The first 64 values rotate as two 32-value
+halves; the remaining 192 values are copied. Each multiplication rounds to BF16
+before the separate BF16 addition. The sign operation precedes the second
+product, preserving the native signed-zero expression. Floating-point
+contraction is disabled; this source intent still requires compiler inspection
+and exact target-GPU validation.
+
+The paired scheduling and partial-tail structure are informed by
+[vLLM's fused Q/K norm/RoPE kernel](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/layers/fused_qk_norm_rope.py).
+That kernel's norm reduction, zero-centered weight and FP32 rotation arithmetic
+are not copied. `tests/qwen38_paired_rope_probe.py` is an explicit CUDA probe
+outside default pytest discovery. It compares exact finite BF16 bits, signed
+zeros, nonfinite classes, unchanged tail bits, storage ownership and strided
+inputs. It can replay trusted task-owned captured postnorm operands. Operator
+success alone does not qualify full-model/Graph state, quality or service gains.

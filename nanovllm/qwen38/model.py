@@ -160,6 +160,9 @@ class FullAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.rope_backend = os.environ.get("NANOVLLM_FULL_ROPE", "native")
+        if self.rope_backend not in ("native", "triton"):
+            raise ValueError(f"Unsupported NANOVLLM_FULL_ROPE: {self.rope_backend}")
         self.prefill_attention = os.environ.get("NANOVLLM_PREFILL_ATTENTION", "native")
         if self.prefill_attention not in ("native", "sdpa_flash"):
             raise ValueError(f"Unsupported NANOVLLM_PREFILL_ATTENTION: {self.prefill_attention}")
@@ -185,7 +188,14 @@ class FullAttention(nn.Module):
         q = self.q_norm(q).transpose(1, 2)
         k = self.k_norm(k_lin.view(1, count, -1, config.head_dim)).transpose(1, 2)
         v = v_lin.view(1, count, -1, config.head_dim).transpose(1, 2)
-        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        if self.rope_backend == "triton":
+            if q.device.type != "cuda" or torch.version.hip is not None:
+                raise ValueError("Triton partial RoPE requires NVIDIA CUDA")
+            from ._triton_rope import paired_partial_rope
+
+            q, k = paired_partial_rope(q, k, cos, sin)
+        else:
+            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         if state.capacity:
             index = positions.reshape(-1)
             state.key.index_copy_(2, index, k)

@@ -57,7 +57,7 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError("Checkpoint index requires a nonempty weight map")
-    from .model import MLP, DeltaNet, FusedProjection
+    from .model import MLP, DeltaNet, FullAttention, FusedProjection
     from .quant import FP8Linear, FP8MergedLinear, fp8_report
 
     gdn_modules = [module for module in model.modules() if isinstance(module, DeltaNet)]
@@ -78,6 +78,10 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     activation_backends = {module.activation_backend for module in mlps}
     if len(activation_backends) > 1:
         raise ValueError("Mixed MLP activation backends are unsupported")
+    full_attention = [module for module in model.modules() if isinstance(module, FullAttention)]
+    rope_backends = {module.rope_backend for module in full_attention}
+    if len(rope_backends) > 1:
+        raise ValueError("Mixed full-attention RoPE backends are unsupported")
     # 融合后的投影只有一份权重：把 checkpoint 里的 q_proj/k_proj/v_proj 等
     # 映射到这份权重的行切片视图上，加载时直接原地写入，不额外占显存。
     fused = [(name, module) for name, module in model.named_modules()
@@ -175,6 +179,12 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
         report["mlp_activation"] = {
             "backend": activation_backends.pop(), "layers": len(mlps),
             "silu_intermediate_dtype": "bfloat16",
+        }
+    if full_attention:
+        report["full_attention_rope"] = {
+            "backend": rope_backends.pop(), "layers": len(full_attention),
+            "scope": "postnorm_partial_rope", "norm_backend": "native",
+            "product_intermediate_dtype": "bfloat16",
         }
     if fp8_modules:
         report.update(fp8_loading_report)
