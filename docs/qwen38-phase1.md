@@ -96,7 +96,8 @@ CPU socket tests do not establish that service acceptance.
 The model math is derived from the Apache-2.0 Transformers Qwen3.5 source.
 See [NOTICE-qwen38](../NOTICE-qwen38) and [Apache license](../LICENSES/Apache-2.0.txt).
 The original nano-vllm code retains its [MIT license](../LICENSE).
-# Optional small-M FP8 GEMM
+
+## Optional small-M FP8 GEMM
 
 `NANOVLLM_FP8_GEMM=flashinfer` selects FlashInfer's SM90 block-scaled
 FP8 GEMM for fewer than 32 activation rows, including single-token decoding.
@@ -110,4 +111,3 @@ The loader reports this mixed backend, and provenance separates FlashInfer and
 Triton Python call counts. These counts include warmup/capture and exclude CUDA
 Graph replay. Selecting the backend does not establish model quality or service
 performance; those require the governing acceptance campaign's evidence.
-
