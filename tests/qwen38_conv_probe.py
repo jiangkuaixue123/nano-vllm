@@ -72,7 +72,8 @@ def get_inputs(weight, count, *, merged=True):
 
 
 def digest(tensor):
-    data = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    # Singleton dimensions may retain non-unit strides after contiguous().
+    data = tensor.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
     return hashlib.sha256(data).hexdigest()
 
 
