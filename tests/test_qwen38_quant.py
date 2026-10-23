@@ -31,8 +31,11 @@ def test_supported_backend_aliases_report_implemented_kernel(monkeypatch, backen
 
 @pytest.mark.parametrize("shape,expected", [((1, 128), "flashinfer"), ((1, 31, 128), "flashinfer"),
                                             ((2, 16, 128), "triton"), ((33, 128), "triton")])
-def test_small_m_dispatch_preserves_shape_and_checkpoint_scales(monkeypatch, shape, expected):
-    monkeypatch.setenv("NANOVLLM_FP8_GEMM", "flashinfer")
+@pytest.mark.parametrize("backend", ["flashinfer", "flashinfer_deepgemm"])
+def test_small_m_dispatch_preserves_shape_and_checkpoint_scales(monkeypatch, shape, expected, backend):
+    monkeypatch.setenv("NANOVLLM_FP8_GEMM", backend)
+    if backend == "flashinfer_deepgemm" and expected == "triton":
+        expected = "deepgemm"
     module = FP8Linear(128, 64)
     inputs = torch.zeros(shape, dtype=torch.bfloat16)
     seen = []
@@ -48,12 +51,21 @@ def test_small_m_dispatch_preserves_shape_and_checkpoint_scales(monkeypatch, sha
         seen.append("triton")
         return x.new_zeros(*x.shape[:-1], 64)
 
+    def deepgemm(x, weight, scales):
+        assert x.ndim == 2 and x.is_contiguous()
+        assert weight is module.weight and scales is module.weight_scale_inv
+        seen.append("deepgemm")
+        return x.new_zeros(x.shape[0], 64)
+
     fake_flashinfer = ModuleType("flashinfer.gemm")
     fake_flashinfer.fp8_blockscale_gemm_sm90 = flashinfer
     fake_triton = ModuleType("nanovllm.qwen38._triton_fp8")
     fake_triton.matmul = triton
+    fake_deepgemm = ModuleType("nanovllm.qwen38._deepgemm_fp8")
+    fake_deepgemm.matmul = deepgemm
     monkeypatch.setitem(sys.modules, "flashinfer.gemm", fake_flashinfer)
     monkeypatch.setitem(sys.modules, "nanovllm.qwen38._triton_fp8", fake_triton)
+    monkeypatch.setitem(sys.modules, "nanovllm.qwen38._deepgemm_fp8", fake_deepgemm)
     output = module._matmul(inputs)
     assert output.shape == (*shape[:-1], 64) and output.dtype == torch.bfloat16
     assert seen == [expected] and module.kernel_calls[expected] == 1
@@ -77,6 +89,48 @@ def test_report_uses_constructed_backend_not_current_environment(monkeypatch, tm
     modules = [module for module in model.modules() if isinstance(module, FP8Linear)]
     with pytest.raises(ValueError, match="consistent backend"):
         fp8_report([*modules, FP8Linear(128, 64)])
+
+
+@pytest.mark.parametrize("shape", [(32, 128), (1, 33, 128)])
+def test_deepgemm_prefill_keeps_original_weights_and_float_scales(monkeypatch, shape):
+    from nanovllm.qwen38 import _deepgemm_fp8
+
+    monkeypatch.setenv("NANOVLLM_FP8_GEMM", "flashinfer_deepgemm")
+    module = FP8Linear(128, 64)
+    module.weight.data.fill_(0.25)
+    module.weight_scale_inv.data.fill_(0.125)
+    before = module.weight.view(torch.uint8).clone()
+    rows = torch.zeros(shape, dtype=torch.bfloat16).reshape(-1, 128)
+    quantized = torch.zeros_like(rows, dtype=torch.float8_e4m3fn)
+    scales = torch.ones((1, len(rows)), dtype=torch.float32).t()
+    monkeypatch.setattr(_deepgemm_fp8, "quantize", lambda x: (quantized, scales))
+    called = []
+
+    def fp8_gemm_nt(a, b, output, *, recipe, disable_ue8m0_cast):
+        assert a[0] is quantized and a[1] is scales
+        assert b[0] is module.weight and b[1] is module.weight_scale_inv
+        assert recipe == (1, 128, 128) and disable_ue8m0_cast is True
+        assert output.dtype == torch.bfloat16 and output.shape == (len(rows), 64)
+        output.fill_(1)
+        called.append(True)
+
+    dependency = ModuleType("deep_gemm")
+    dependency.fp8_gemm_nt = fp8_gemm_nt
+    monkeypatch.setitem(sys.modules, "deep_gemm", dependency)
+    result = module._matmul(rows.reshape(shape))
+    assert result.shape == (*shape[:-1], 64) and torch.all(result == 1)
+    assert called == [True] and module.kernel_calls["deepgemm"] == 1
+    assert torch.equal(module.weight.view(torch.uint8), before)
+    assert torch.all(module.weight_scale_inv == 0.125)
+
+
+def test_deepgemm_missing_dependency_does_not_fallback(monkeypatch):
+    monkeypatch.setenv("NANOVLLM_FP8_GEMM", "flashinfer_deepgemm")
+    module = FP8Linear(128, 64)
+    monkeypatch.setitem(sys.modules, "deep_gemm", None)
+    with pytest.raises(ModuleNotFoundError):
+        module._matmul(torch.zeros(32, 128, dtype=torch.bfloat16))
+    assert sum(module.kernel_calls.values()) == 0
 
 
 def tiny_fp8_model():
