@@ -159,6 +159,44 @@ def fuse_fp8_projections(model):
     return len(groups)
 
 
+def fuse_bf16_gdn_ba_projections(model):
+    """Merge excluded BF16 b/a rows after FP8 conversion, before allocation."""
+    from .model import DeltaNet, FusedProjection
+
+    groups = []
+    names = ("in_proj_b", "in_proj_a")
+    for parent in model.modules():
+        if not isinstance(parent, DeltaNet):
+            continue
+        qkv = getattr(parent, "in_proj_qkvz", None)
+        if qkv is None:
+            qkv = getattr(parent, "in_proj_qkv", None)
+        parts = [getattr(parent, name, None) for name in names]
+        if (not isinstance(qkv, FP8Linear) or not qkv.weight.is_meta
+                or not qkv.weight_scale_inv.is_meta
+                or not all(type(part) is nn.Linear for part in parts)
+                or not all(part.weight.is_meta and part.weight.dtype == torch.bfloat16
+                           and part.bias is None
+                           and part.in_features == parent.config.hidden_size
+                           and part.out_features == parent.config.linear_num_value_heads
+                           for part in parts)):
+            raise ValueError("BF16 GDN b/a fusion requires unallocated excluded linears after FP8 conversion")
+        first = parts[0]
+        merged = FusedProjection(
+            first.in_features, [part.out_features for part in parts], names,
+            device="meta", dtype=torch.bfloat16,
+        )
+        groups.append((parent, merged))
+    if not groups:
+        raise ValueError("No supported BF16 GDN b/a projections")
+    # Validate every layer before discarding any original parameter.
+    for parent, merged in groups:
+        for name in names:
+            delattr(parent, name)
+        parent.in_proj_ba = merged
+    return len(groups)
+
+
 def convert_fp8_linears(model: nn.Module, exclusions: tuple[str, ...]) -> int:
     """Replace precisely the supported text projections, checking HF exclusions.
 

@@ -350,12 +350,15 @@ class DeltaNet(nn.Module):
         config, count = self.config, x.shape[1]
         if hasattr(self, "in_proj_fused"):
             qkv_lin, z_lin, b_lin, a_lin = self.in_proj_fused(x)
-        elif hasattr(self, "in_proj_qkvz"):
-            qkv_lin, z_lin = self.in_proj_qkvz(x)
-            b_lin, a_lin = self.in_proj_b(x), self.in_proj_a(x)
         else:
-            qkv_lin, z_lin = self.in_proj_qkv(x), self.in_proj_z(x)
-            b_lin, a_lin = self.in_proj_b(x), self.in_proj_a(x)
+            if hasattr(self, "in_proj_qkvz"):
+                qkv_lin, z_lin = self.in_proj_qkvz(x)
+            else:
+                qkv_lin, z_lin = self.in_proj_qkv(x), self.in_proj_z(x)
+            b_lin, a_lin = (
+                self.in_proj_ba(x) if hasattr(self, "in_proj_ba")
+                else (self.in_proj_b(x), self.in_proj_a(x))
+            )
         raw = qkv_lin.transpose(1, 2)
         gate = z_lin.reshape(1, count, -1, config.linear_value_head_dim)
         buffered = state.capacity > 0 and state.conv is not None

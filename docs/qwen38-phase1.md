@@ -160,3 +160,20 @@ This follows vLLM's merged projection layout without importing its runtime.
 Larger GEMM output shapes can change floating-point accumulation, so structural
 CPU tests do not establish numerical equivalence or a service speedup. Operator,
 Graph, task-quality and end-to-end comparisons remain required before acceptance.
+
+### Merged BF16 GDN b/a projections (experimental)
+
+For an FP8 checkpoint, `NANOVLLM_GDN_BA_PROJECTIONS=merged` combines each GDN
+layer's excluded BF16 b/a weights into one BF16 projection, in `[b, a]` order,
+before allocation. The default is `separate`; this option is independent of
+`NANOVLLM_FP8_PROJECTIONS`. FP8 exclusions, weight bytes and block scales remain
+unchanged. Original checkpoint b/a tensors load directly into their row slices,
+and the loader reports `gdn_ba_projection_layout`. Unsupported option values
+and requesting this option for a BF16 checkpoint fail explicitly.
+
+This follows the merged b/a layout in the inspected
+[vLLM implementation](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py#L677),
+without importing its runtime. Changing GEMM output width can change cuBLAS
+reduction order and BF16 outputs. CPU layout/loading checks do not establish
+numerical equivalence, Graph correctness, model quality or service speedup;
+those remain unverified pending their corresponding GPU and acceptance checks.

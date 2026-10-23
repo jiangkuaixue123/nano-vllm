@@ -140,6 +140,12 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
             "merged" if any(isinstance(module, FP8MergedLinear) for module in fp8_modules.values())
             else "separate"
         )
+        report["gdn_ba_projection_layout"] = (
+            "merged" if any(isinstance(module, FusedProjection)
+                            and module.names == ("in_proj_b", "in_proj_a")
+                            for _, module in fused)
+            else "separate"
+        )
     return report
 
 
@@ -160,6 +166,11 @@ def load_checkpoint(model_path: str | Path, *, device: str = "cuda:0"):
         raise ValueError("Unsupported NANOVLLM_FP8_PROJECTIONS")
     if projection_layout == "merged" and config.weight_format != "fp8":
         raise ValueError("Merged FP8 projections require an FP8 checkpoint")
+    ba_layout = os.environ.get("NANOVLLM_GDN_BA_PROJECTIONS", "separate")
+    if ba_layout not in ("separate", "merged"):
+        raise ValueError("Unsupported NANOVLLM_GDN_BA_PROJECTIONS")
+    if ba_layout == "merged" and config.weight_format != "fp8":
+        raise ValueError("Merged BF16 GDN b/a projections require an FP8 checkpoint")
     with torch.device("meta"):
         model = Qwen38ForCausalLM(config).to(dtype=torch.bfloat16)
         if config.weight_format == "fp8":
@@ -174,6 +185,10 @@ def load_checkpoint(model_path: str | Path, *, device: str = "cuda:0"):
                 from .quant import fuse_fp8_projections
 
                 fuse_fp8_projections(model)
+            if ba_layout == "merged":
+                from .quant import fuse_bf16_gdn_ba_projections
+
+                fuse_bf16_gdn_ba_projections(model)
         else:
             model.fuse_projections()
     model.to_empty(device=device)
