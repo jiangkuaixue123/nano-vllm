@@ -1,6 +1,8 @@
 """CPU structural and checkpoint tests, not evidence of CUDA FP8 execution."""
 
 import json
+import sys
+from types import ModuleType
 
 import pytest
 import torch
@@ -9,10 +11,10 @@ from safetensors.torch import save_file
 from nanovllm.qwen38.config import Qwen38TextConfig
 from nanovllm.qwen38.loader import load_weights
 from nanovllm.qwen38.model import Qwen38ForCausalLM
-from nanovllm.qwen38.quant import FP8Linear, convert_fp8_linears
+from nanovllm.qwen38.quant import FP8Linear, convert_fp8_linears, fp8_report
 
 
-@pytest.mark.parametrize("backend", ["flashinfer", "deepgemm", "typo"])
+@pytest.mark.parametrize("backend", ["deepgemm", "typo"])
 def test_unimplemented_backend_is_not_silently_ignored(monkeypatch, backend):
     monkeypatch.setenv("NANOVLLM_FP8_GEMM", backend)
     with pytest.raises(ValueError, match="Unsupported NANOVLLM_FP8_GEMM"):
@@ -25,6 +27,56 @@ def test_supported_backend_aliases_report_implemented_kernel(monkeypatch, backen
     module = FP8Linear(128, 128, device="meta")
     assert module.backend == "triton_block_fp8"
     assert module.kernel_name == "qwen38_block_fp8"
+
+
+@pytest.mark.parametrize("shape,expected", [((1, 128), "flashinfer"), ((1, 31, 128), "flashinfer"),
+                                            ((2, 16, 128), "triton"), ((33, 128), "triton")])
+def test_small_m_dispatch_preserves_shape_and_checkpoint_scales(monkeypatch, shape, expected):
+    monkeypatch.setenv("NANOVLLM_FP8_GEMM", "flashinfer")
+    module = FP8Linear(128, 64)
+    inputs = torch.zeros(shape, dtype=torch.bfloat16)
+    seen = []
+
+    def flashinfer(x, weight, *, weight_scale, out_dtype):
+        assert x.ndim == 2 and x.is_contiguous() and out_dtype == torch.bfloat16
+        assert weight is module.weight and weight_scale is module.weight_scale_inv
+        seen.append("flashinfer")
+        return x.new_zeros(x.shape[0], 64)
+
+    def triton(x, weight, scales):
+        assert weight is module.weight and scales is module.weight_scale_inv
+        seen.append("triton")
+        return x.new_zeros(*x.shape[:-1], 64)
+
+    fake_flashinfer = ModuleType("flashinfer.gemm")
+    fake_flashinfer.fp8_blockscale_gemm_sm90 = flashinfer
+    fake_triton = ModuleType("nanovllm.qwen38._triton_fp8")
+    fake_triton.matmul = triton
+    monkeypatch.setitem(sys.modules, "flashinfer.gemm", fake_flashinfer)
+    monkeypatch.setitem(sys.modules, "nanovllm.qwen38._triton_fp8", fake_triton)
+    output = module._matmul(inputs)
+    assert output.shape == (*shape[:-1], 64) and output.dtype == torch.bfloat16
+    assert seen == [expected] and module.kernel_calls[expected] == 1
+
+
+def test_flashinfer_missing_dependency_does_not_fallback(monkeypatch):
+    monkeypatch.setenv("NANOVLLM_FP8_GEMM", "flashinfer")
+    module = FP8Linear(128, 64)
+    monkeypatch.setitem(sys.modules, "flashinfer.gemm", None)
+    with pytest.raises(ModuleNotFoundError):
+        module._matmul(torch.zeros(1, 128, dtype=torch.bfloat16))
+    assert module.native_fp8_calls == 0 and sum(module.kernel_calls.values()) == 0
+
+
+def test_report_uses_constructed_backend_not_current_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("NANOVLLM_FP8_GEMM", "flashinfer")
+    model, _ = tiny_fp8_model()
+    write_fp8_checkpoint(tmp_path, model)
+    monkeypatch.setenv("NANOVLLM_FP8_GEMM", "triton")
+    assert load_weights(model, tmp_path)["backend"] == "flashinfer_small_m_triton_prefill"
+    modules = [module for module in model.modules() if isinstance(module, FP8Linear)]
+    with pytest.raises(ValueError, match="consistent backend"):
+        fp8_report([*modules, FP8Linear(128, 64)])
 
 
 def tiny_fp8_model():
