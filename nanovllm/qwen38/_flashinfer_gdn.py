@@ -10,6 +10,9 @@ import torch
 
 
 def prefill(query, key, value, decay, beta, initial):
+    # Q/K may keep their original grouped heads; V, gates and state retain all
+    # value heads. Normalization and the [K,V] <-> [V,K] state boundary are the
+    # same for grouped and expanded inputs. Decode uses its separate adapter.
     # Optional CUDA dependency: importing the ordinary CPU model must not load it.
     from flashinfer.gdn_prefill import chunk_gated_delta_rule
 

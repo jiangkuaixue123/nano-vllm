@@ -145,6 +145,17 @@ activation dtype, and fused decode computes gates in FP32 without the native
 BF16 sigmoid intermediate. Operator, Graph, full-model quality and end-to-end
 qualification are required; enabling it is not a quality or parity claim.
 
+With this backend, `NANOVLLM_GDN_PREFILL_QK_LAYOUT=grouped` keeps the original
+Q/K heads through prefill normalization and the FlashInfer call. For the
+supported configuration, each of 16 Q/K heads serves three of the 48 value
+heads. The default `expanded` path and single-token decode retain 48 Q/K heads.
+Convolution, gates and recurrent state keep their existing computation and
+layout. Grouped prefill requires FlashInfer; incompatible or unknown selections
+fail during model construction. The loader report, also returned by health
+provenance, records the constructed backend, Q/K layout and head counts. CPU
+mock tests cover routing and state layout; GPU operator and matched end-to-end
+qualification are still required for this option.
+
 ### Merged FP8 projections (experimental)
 
 `NANOVLLM_FP8_PROJECTIONS=merged` combines gate/up, Q/K/V and GDN QKV/Z

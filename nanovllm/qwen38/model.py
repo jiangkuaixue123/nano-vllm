@@ -318,6 +318,11 @@ class DeltaNet(nn.Module):
         self.gdn_backend = os.environ.get("NANOVLLM_GDN", "native")
         if self.gdn_backend not in ("native", "flashinfer"):
             raise ValueError(f"Unsupported NANOVLLM_GDN: {self.gdn_backend}")
+        self.gdn_prefill_qk_layout = os.environ.get("NANOVLLM_GDN_PREFILL_QK_LAYOUT", "expanded")
+        if self.gdn_prefill_qk_layout not in ("expanded", "grouped"):
+            raise ValueError("Unsupported NANOVLLM_GDN_PREFILL_QK_LAYOUT")
+        if self.gdn_prefill_qk_layout == "grouped" and self.gdn_backend != "flashinfer":
+            raise ValueError("Grouped GDN prefill Q/K requires FlashInfer")
         if self.gdn_backend == "flashinfer" and (
             config.linear_key_head_dim != 128 or config.linear_value_head_dim != 128
         ):
@@ -384,10 +389,14 @@ class DeltaNet(nn.Module):
         key = key.reshape(1, count, -1, config.linear_key_head_dim)
         value = value.reshape(1, count, -1, config.linear_value_head_dim)
         repeats = config.linear_num_value_heads // config.linear_num_key_heads
-        query, key = (
-            query.repeat_interleave(repeats, 2),
-            key.repeat_interleave(repeats, 2),
-        )
+        # FlashInfer prefill accepts grouped-value attention: output head h uses
+        # Q/K head h // repeats. Normalize each original head once in the bridge.
+        # Single-token decode and the default/native paths retain expanded heads.
+        if self.gdn_prefill_qk_layout == "expanded" or (previous and count == 1):
+            query, key = (
+                query.repeat_interleave(repeats, 2),
+                key.repeat_interleave(repeats, 2),
+            )
         current = None if state.fresh else state.recurrent
         if self.gdn_backend == "flashinfer":
             from . import _flashinfer_gdn

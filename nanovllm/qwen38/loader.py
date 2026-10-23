@@ -57,9 +57,15 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError("Checkpoint index requires a nonempty weight map")
-    from .model import FusedProjection
+    from .model import DeltaNet, FusedProjection
     from .quant import FP8Linear, FP8MergedLinear, fp8_report
 
+    gdn_modules = [module for module in model.modules() if isinstance(module, DeltaNet)]
+    gdn_layouts = {(module.gdn_backend, module.gdn_prefill_qk_layout,
+                    module.config.linear_num_key_heads, module.config.linear_num_value_heads)
+                   for module in gdn_modules}
+    if len(gdn_layouts) > 1:
+        raise ValueError("GDN layers disagree on prefill execution layout")
     parameters = dict(model.named_parameters())
     # 融合后的投影只有一份权重：把 checkpoint 里的 q_proj/k_proj/v_proj 等
     # 映射到这份权重的行切片视图上，加载时直接原地写入，不额外占显存。
@@ -134,6 +140,13 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
                         parameters[name].copy_(shard.get_tensor(key))
     report = {"loaded_parameters": len(mapped), "excluded_tensors": skipped,
               "scope": "text_only", "dtype": "bfloat16"}
+    if gdn_layouts:
+        backend, layout, key_heads, value_heads = gdn_layouts.pop()
+        report["gdn_prefill"] = {
+            "backend": backend, "qk_layout": layout, "layers": len(gdn_modules),
+            "query_key_heads": key_heads if layout == "grouped" else value_heads,
+            "value_heads": value_heads, "decode_qk_layout": "expanded",
+        }
     if fp8_modules:
         report.update(fp8_report(fp8_modules.values()))
         report["projection_layout"] = (
