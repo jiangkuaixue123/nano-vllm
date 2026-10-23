@@ -69,6 +69,10 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     outnorm_backends = {module.norm.outnorm_backend for module in gdn_modules}
     if len(outnorm_backends) > 1:
         raise ValueError("Mixed GDN output norm backends are unsupported")
+    gdn_convolutions = {(module.gdn_conv_backend, module.config.linear_conv_kernel_dim)
+                        for module in gdn_modules}
+    if len(gdn_convolutions) > 1:
+        raise ValueError("GDN layers disagree on convolution backend or window")
     parameters = dict(model.named_parameters())
     mlps = [module for module in model.modules() if isinstance(module, MLP)]
     activation_backends = {module.activation_backend for module in mlps}
@@ -147,6 +151,14 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
                         parameters[name].copy_(shard.get_tensor(key))
     report = {"loaded_parameters": len(mapped), "excluded_tensors": skipped,
               "scope": "text_only", "dtype": "bfloat16"}
+    if gdn_convolutions:
+        conv_backend, conv_width = gdn_convolutions.pop()
+        report["gdn_convolution"] = {
+            "backend": conv_backend, "layers": len(gdn_modules),
+            "state_entries": conv_width, "conv_output_dtype": "bfloat16",
+            "fresh_prefill": conv_backend, "single_token_decode": conv_backend,
+            "cached_multi_token": "native",
+        }
     if gdn_layouts:
         backend, layout, key_heads, value_heads = gdn_layouts.pop()
         report["gdn_prefill"] = {

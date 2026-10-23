@@ -156,6 +156,31 @@ provenance, records the constructed backend, Q/K layout and head counts. CPU
 mock tests cover routing and state layout; GPU operator and matched end-to-end
 qualification are still required for this option.
 
+### Fused GDN convolution and SiLU (experimental)
+
+`NANOVLLM_GDN_CONV=triton` selects a lazy-loaded CUDA BF16 implementation for
+fresh prefill and cached single-token decode. The default remains `native`.
+This option requires a four-tap kernel; cached multi-token continuation keeps
+the native computation. Unknown selections and unsupported CUDA tensor
+contracts fail explicitly. The loader and health provenance expose the
+constructed `gdn_convolution` backend and its execution scope.
+
+The kernel reads projection views directly and retains the four-entry request
+window. Fresh calls ignore stale state, left-pad short inputs with zeros, and
+save the final four inputs. Decode consumes history entries 1–3 plus the new
+input and shifts the window. Buffered state keeps its addresses; unbuffered
+state uses new storage with the native stride ordering. Output remains NCL
+before the existing transpose and Q/K/V split.
+
+Each convolution accumulates in FP32 in tap order with explicit FMA, rounds to
+BF16, then computes SiLU in FP32 and rounds again to BF16. Keeping this boundary
+does not prove bitwise equivalence to a particular Torch/CUDA build: FMA
+contraction, exp/div lowering and subnormal handling require GPU observation.
+The opt-in probe `tests/qwen38_conv_probe.py` records bit differences, numerical
+errors, state ownership/layout and Graph replay; it defines no tolerance or
+quality/performance acceptance. Full-model and service validation remain
+separate. Quantization, attention and GDN recurrence are unchanged.
+
 ### Merged FP8 projections (experimental)
 
 `NANOVLLM_FP8_PROJECTIONS=merged` combines gate/up, Q/K/V and GDN QKV/Z

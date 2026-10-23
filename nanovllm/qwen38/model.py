@@ -345,6 +345,11 @@ class DeltaNet(nn.Module):
         self.gdn_backend = os.environ.get("NANOVLLM_GDN", "native")
         if self.gdn_backend not in ("native", "flashinfer"):
             raise ValueError(f"Unsupported NANOVLLM_GDN: {self.gdn_backend}")
+        self.gdn_conv_backend = os.environ.get("NANOVLLM_GDN_CONV", "native")
+        if self.gdn_conv_backend not in ("native", "triton"):
+            raise ValueError("Unsupported NANOVLLM_GDN_CONV")
+        if self.gdn_conv_backend == "triton" and config.linear_conv_kernel_dim != 4:
+            raise ValueError("Triton GDN convolution requires a four-entry window")
         self.gdn_prefill_qk_layout = os.environ.get("NANOVLLM_GDN_PREFILL_QK_LAYOUT", "expanded")
         if self.gdn_prefill_qk_layout not in ("expanded", "grouped"):
             raise ValueError("Unsupported NANOVLLM_GDN_PREFILL_QK_LAYOUT")
@@ -395,20 +400,30 @@ class DeltaNet(nn.Module):
         gate = z_lin.reshape(1, count, -1, config.linear_value_head_dim)
         buffered = state.capacity > 0 and state.conv is not None
         previous = state.conv is not None and not state.fresh
-        mixed = torch.cat((state.conv, raw), dim=-1) if previous else raw
-        kernel = config.linear_conv_kernel_dim
-        window = F.pad(mixed, (max(0, kernel - mixed.shape[-1]), 0))[:, :, -kernel:]
-        if buffered:
-            state.conv.copy_(window)
+        if self.gdn_conv_backend == "triton" and (not previous or count == 1):
+            from ._triton_conv import causal_conv_silu
+
+            convolved, state.conv = causal_conv_silu(
+                raw, self.conv1d.weight, state.conv if previous else None,
+                state_out=state.conv if buffered else None,
+            )
+            mixed = convolved.transpose(1, 2)
         else:
-            state.conv = window.clone()
-        padding = 0 if previous and count == 1 else kernel - 1
-        convolved = F.conv1d(
-            mixed, self.conv1d.weight, groups=mixed.shape[1], padding=padding
-        )
-        if padding:
-            convolved = convolved[:, :, : mixed.shape[-1]]
-        mixed = F.silu(convolved[:, :, -count:]).transpose(1, 2)
+            # Default and cached multi-token continuation retain the native path.
+            mixed = torch.cat((state.conv, raw), dim=-1) if previous else raw
+            kernel = config.linear_conv_kernel_dim
+            window = F.pad(mixed, (max(0, kernel - mixed.shape[-1]), 0))[:, :, -kernel:]
+            if buffered:
+                state.conv.copy_(window)
+            else:
+                state.conv = window.clone()
+            padding = 0 if previous and count == 1 else kernel - 1
+            convolved = F.conv1d(
+                mixed, self.conv1d.weight, groups=mixed.shape[1], padding=padding
+            )
+            if padding:
+                convolved = convolved[:, :, : mixed.shape[-1]]
+            mixed = F.silu(convolved[:, :, -count:]).transpose(1, 2)
         query, key, value = mixed.split(
             (self.key_dim, self.key_dim, self.value_dim), dim=-1
         )
