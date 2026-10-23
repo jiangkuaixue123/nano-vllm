@@ -231,3 +231,42 @@ values, production merged views, arbitrary positive strides and masked tails.
 It requires exact finite-result bits and matching nonfinite classifications;
 no numerical tolerance is substituted. Operator success alone establishes no
 model quality, Graph-state parity or service-performance result.
+
+## Optional fused GDN output norm
+
+`NANOVLLM_GDN_OUTNORM=triton` selects the GDN output RMSNorm plus SiLU/gate
+multiply at construction; `native` remains the default. Unknown values fail
+at construction. The loader and health provenance expose `gdn_outnorm` with
+the constructed backend, layer count and the two BF16 intermediate dtypes.
+Changing the environment after construction does not change execution or reporting.
+
+The opt-in kernel accepts inference-only NVIDIA CUDA BF16 inputs shaped
+`[1,tokens,heads,128]`, canonical contiguous and 8-byte aligned input storage,
+contiguous aligned weights, and
+independent nonnegative gate strides. It reads merged projection gate views
+without materializing them and returns a fresh contiguous output. It preserves
+the existing detached BF16 weight cache and does not touch recurrent or convolution
+states. Other shapes and devices remain supported by the unchanged native path.
+Singleton dimensions must also have canonical strides: channels-last-like
+strides can otherwise select Torch's composite RMSNorm reduction.
+
+This targets Torch's aligned width-128 RMSNorm reduction: four adjacent values
+per lane, then the lane-zero shuffle-down addition tree. FP32 norm and SiLU
+results each round to BF16 before the final multiplication. Explicit square/add
+FMA and libdevice reciprocal square root/exp require target compiler inspection;
+automatic floating-point fusion is disabled for the remaining arithmetic.
+The inspected [Torch reduction](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/aten/src/ATen/native/cuda/layer_norm_kernel.cu)
+and [vLLM gated norm](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/third_party/flash_linear_attention/ops/layernorm_guard.py)
+have different arithmetic contracts: vLLM keeps FP32 through gating.
+This source implementation establishes no GPU rounding or performance result.
+
+`tests/qwen38_gdn_outnorm_probe.py` is an explicit CUDA diagnostic outside default
+pytest discovery. The caller authenticates checkpoint files using the frozen
+model manifest, then supplies `--model <MODEL_PATH> --output <NEW_RECEIPT>`.
+It checks all checkpoint GDN norm weights, merged and strided gates, decode/8K
+shapes, tails, exceptional BF16 values and input immutability. Repeated
+`--operands <CAPTURE>` arguments replay actual first/last-layer inputs saved as
+`x`, `gate`, `weight`, `epsilon`, `layer_index` dictionaries with original strides.
+Finite outputs require exact bits, including signed zero; nonfinite classifications
+must match. Failures are retained and no tolerance is substituted. Actual full-model
+outputs, complete Graph state and service performance require separate validation.

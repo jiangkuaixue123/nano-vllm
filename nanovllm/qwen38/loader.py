@@ -66,6 +66,9 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
                    for module in gdn_modules}
     if len(gdn_layouts) > 1:
         raise ValueError("GDN layers disagree on prefill execution layout")
+    outnorm_backends = {module.norm.outnorm_backend for module in gdn_modules}
+    if len(outnorm_backends) > 1:
+        raise ValueError("Mixed GDN output norm backends are unsupported")
     parameters = dict(model.named_parameters())
     mlps = [module for module in model.modules() if isinstance(module, MLP)]
     activation_backends = {module.activation_backend for module in mlps}
@@ -150,6 +153,10 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
             "backend": backend, "qk_layout": layout, "layers": len(gdn_modules),
             "query_key_heads": key_heads if layout == "grouped" else value_heads,
             "value_heads": value_heads, "decode_qk_layout": "expanded",
+        }
+        report["gdn_outnorm"] = {
+            "backend": outnorm_backends.pop(), "layers": len(gdn_modules),
+            "norm_intermediate_dtype": "bfloat16", "silu_intermediate_dtype": "bfloat16",
         }
     if mlps:
         report["mlp_activation"] = {

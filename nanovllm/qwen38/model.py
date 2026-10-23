@@ -105,6 +105,9 @@ class RMSNorm(nn.Module):
 class GatedRMSNorm(nn.Module):
     def __init__(self, size: int, eps: float):
         super().__init__()
+        self.outnorm_backend = os.environ.get("NANOVLLM_GDN_OUTNORM", "native")
+        if self.outnorm_backend not in ("native", "triton"):
+            raise ValueError(f"Unsupported NANOVLLM_GDN_OUTNORM: {self.outnorm_backend}")
         self.weight = nn.Parameter(torch.ones(size))
         self.eps = eps
 
@@ -118,6 +121,12 @@ class GatedRMSNorm(nn.Module):
         return cached
 
     def forward(self, x, gate):
+        if self.outnorm_backend == "triton":
+            if x.device.type != "cuda" or torch.version.hip is not None:
+                raise ValueError("Triton GDN output norm requires NVIDIA CUDA")
+            from ._triton_gdn_outnorm import gated_rms_norm
+
+            return gated_rms_norm(x, gate, self._fused_weight(x.dtype), self.eps)
         # 数值路径变更：silu 由 fp32 改为按 x.dtype 计算（省两次 cast 与一次回写），
         # 与 v7 之前的行为不同，已在 PR 说明里单独标注。
         return F.rms_norm(x, (x.shape[-1],), self._fused_weight(x.dtype), self.eps) * F.silu(gate)
