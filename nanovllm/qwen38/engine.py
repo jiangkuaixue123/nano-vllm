@@ -187,6 +187,9 @@ class DedicatedEngine:
                          "executed_modules": sum(count > 0 for count in calls.values()), "per_module_calls": calls,
                          "kernel_calls": {kernel: sum(module.kernel_calls[kernel] for module in modules.values())
                                           for kernel in ("flashinfer", "triton", "deepgemm")},
+                         "deepgemm_quantization_calls": {
+                             backend: sum(module.deepgemm_quantization_calls[backend] for module in modules.values())
+                             for backend in ("native", "row4")},
                          "weight_dtype": "float8_e4m3fn", "scale_dtype": "float32",
                          "actual_dtypes_valid": all(module.weight.dtype == torch.float8_e4m3fn
                                                     and module.weight_scale_inv.dtype == torch.float32
