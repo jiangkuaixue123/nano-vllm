@@ -63,6 +63,11 @@ def gated_rms_norm(x, gate, weight, eps):
         raise ValueError("Fused GDN output norm requires [1,tokens,heads,128] and weight [128]")
     if not x.is_contiguous() or not weight.is_contiguous():
         raise ValueError("Fused GDN output norm requires contiguous input and weight")
+    # Singleton token/head strides can still suggest channels-last to Torch,
+    # which selects its composite RMSNorm with a different reduction tree.
+    canonical = (x.shape[1] * x.shape[2] * 128, x.shape[2] * 128, 128, 1)
+    if x.stride() != canonical:
+        raise ValueError("Fused GDN output norm requires canonical contiguous input strides")
     if x.data_ptr() % 8 or weight.data_ptr() % 8:
         raise ValueError("Fused GDN output norm requires 8-byte aligned input and weight")
     if any(t.requires_grad for t in operands):

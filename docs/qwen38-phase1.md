@@ -241,11 +241,14 @@ the constructed backend, layer count and the two BF16 intermediate dtypes.
 Changing the environment after construction does not change execution or reporting.
 
 The opt-in kernel accepts inference-only NVIDIA CUDA BF16 inputs shaped
-`[1,tokens,heads,128]`, contiguous and 8-byte aligned input/weight storage, and
+`[1,tokens,heads,128]`, canonical contiguous and 8-byte aligned input storage,
+contiguous aligned weights, and
 independent nonnegative gate strides. It reads merged projection gate views
 without materializing them and returns a fresh contiguous output. It preserves
 the existing detached BF16 weight cache and does not touch recurrent or convolution
 states. Other shapes and devices remain supported by the unchanged native path.
+Singleton dimensions must also have canonical strides: channels-last-like
+strides can otherwise select Torch's composite RMSNorm reduction.
 
 This targets Torch's aligned width-128 RMSNorm reduction: four adjacent values
 per lane, then the lane-zero shuffle-down addition tree. FP32 norm and SiLU
