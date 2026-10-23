@@ -111,3 +111,18 @@ Model calls are serialized one token step at a time; concurrent requests own
 independent states. This functionality does not establish throughput or latency
 improvement. CPU fake-model socket tests verify protocol and lifetime behavior;
 real FP8 model functional service acceptance is a separate evidence milestone.
+
+### Initial causal prefill with merged FP8 projections
+
+`NANOVLLM_PREFILL_ATTENTION=sdpa_flash` selects PyTorch SDPA's required
+`FLASH_ATTENTION` backend for fresh causal prefill only. The option composes
+with `NANOVLLM_FP8_PROJECTIONS=merged`; cached continuation and decode retain
+the existing position-aware attention. Default remains `native`, and unsupported
+backend/device execution raises rather than selecting a fallback.
+
+This is the previously reviewed initial-prefill implementation applied after the
+merged-projection change. Merged V is a strided view of packed QKV. The CPU test
+covers routing and preservation of that view, but GPU support, numerical/task
+quality and HTTP timing must be checked on the combined source. It is not a
+claim that PyTorch's backend is the same FlashAttention version used by the
+matched vLLM baseline. No performance gain is asserted by this preparation.
