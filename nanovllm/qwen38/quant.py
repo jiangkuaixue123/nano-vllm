@@ -68,6 +68,33 @@ class FP8Linear(nn.Module):
         self.native_fp8_calls += 1
         return result
 
+    def _prepare_silu_fp8(self, device):
+        """Source-private M1 down projection; warm the full bridge before capture."""
+        from ._silu_fp8 import projection_reason
+
+        reason = projection_reason(self, device)
+        if reason:
+            raise ValueError("SwiGLU FP8 projection: " + reason)
+        with torch.cuda.device(device):
+            if (torch.cuda.is_current_stream_capturing()
+                    and getattr(self, "_silu_fp8_ready_device", None) != device):
+                raise RuntimeError("Warm the SwiGLU FP8 path eagerly before CUDA Graph capture")
+            from flashinfer.gemm import fp8_blockscale_gemm_sm90
+
+        return fp8_blockscale_gemm_sm90
+
+    def _forward_silu_prequantized(self, values, scales, input_shape):
+        from ._silu_fp8 import validate_prequantized
+
+        validate_prequantized(self, values, scales, input_shape)
+        with torch.cuda.device(values.device):
+            gemm = self._prepare_silu_fp8(values.device)
+            result = gemm(values, self.weight, input_scale=scales,
+                          weight_scale=self.weight_scale_inv, out_dtype=torch.bfloat16)
+        self.kernel_calls["flashinfer"] += 1
+        self.native_fp8_calls += 1
+        return result.reshape(*input_shape[:-1], self.out_features)
+
     def _matmul(self, inputs: torch.Tensor) -> torch.Tensor:
         # Match vLLM's small-M SM90 choice; prefill follows the selected backend.
         # FlashInfer's BF16 input path quantizes activations internally.

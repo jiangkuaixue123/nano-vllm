@@ -87,6 +87,9 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     postnorm_backends = {module.postnorm_fp8_backend for module in mlps}
     if len(postnorm_backends) > 1:
         raise ValueError("Mixed post-attention FP8 backends are unsupported")
+    silu_fp8_backends = {module.silu_fp8_backend for module in mlps}
+    if len(silu_fp8_backends) > 1:
+        raise ValueError("Mixed SwiGLU FP8 backends are unsupported")
     activation_backends = {module.activation_backend for module in mlps}
     if len(activation_backends) > 1:
         raise ValueError("Mixed MLP activation backends are unsupported")
@@ -213,6 +216,12 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
         report["mlp_activation"] = {
             "backend": activation_backends.pop(), "layers": len(mlps),
             "silu_intermediate_dtype": "bfloat16",
+        }
+        report["silu_fp8"] = {
+            "requested_backend": silu_fp8_backends.pop(), "layers": len(mlps),
+            "scope": "m1_silu_fp8_down", "intermediate_dtype": "bfloat16",
+            "quantizer": "fi_block128_fp32_scales", "scale_backing": [136, 4],
+            "fallback": "native_for_unsupported_operand_metadata", "execution_observed": False,
         }
     if full_attention:
         report["full_attention_prefill"] = {
