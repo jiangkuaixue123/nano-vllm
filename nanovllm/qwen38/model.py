@@ -499,6 +499,10 @@ class DeltaNet(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.postnorm_fp8_backend = os.environ.get("NANOVLLM_POSTNORM_FP8", "native")
+        if self.postnorm_fp8_backend not in ("native", "triton"):
+            raise ValueError(f"Unsupported NANOVLLM_POSTNORM_FP8: {self.postnorm_fp8_backend}")
+        self.postnorm_fp8_calls = {"native": 0, "triton": 0}
         self.activation_backend = os.environ.get("NANOVLLM_MLP_ACTIVATION", "native")
         if self.activation_backend not in ("native", "triton"):
             raise ValueError(f"Unsupported NANOVLLM_MLP_ACTIVATION: {self.activation_backend}")
@@ -528,6 +532,23 @@ class MLP(nn.Module):
             gate, up = self.gate_up_proj(x)
         else:
             gate, up = self.gate_proj(x), self.up_proj(x)
+        return self._forward_gate_up(gate, up)
+
+    def postnorm_fp8_execution(self, residual, delta):
+        from ._postnorm_fp8 import execution
+
+        return execution(residual, delta, getattr(self, "gate_up_proj", None), self.postnorm_fp8_backend)
+
+    def postnorm_gate_up(self, residual, delta, norm):
+        from ._postnorm_fp8 import postnorm_gate_up
+
+        residual, gate, up, selected = postnorm_gate_up(
+            residual, delta, norm, self.gate_up_proj, self.postnorm_fp8_backend,
+        )
+        self.postnorm_fp8_calls[selected] += 1
+        return residual, gate, up
+
+    def _forward_gate_up(self, gate, up):
         if self.activation_backend == "triton":
             if gate.device.type != "cuda" or torch.version.hip is not None:
                 raise ValueError("Triton MLP activation requires NVIDIA CUDA")
@@ -560,6 +581,9 @@ class DecoderLayer(nn.Module):
         # 残差相加与 post-attention norm 折成一个 kernel：x ← x + mixed（原地），
         # 同时产出归一化结果，少一次物化。数值语义与分开写相同。
         norm = self.post_attention_layernorm
+        if self.mlp.postnorm_fp8_backend == "triton" and hasattr(self.mlp, "gate_up_proj"):
+            x, gate, up = self.mlp.postnorm_gate_up(x, mixed, norm)
+            return x + self.mlp._forward_gate_up(gate, up)
         if x.is_cuda and x.dtype == torch.bfloat16 and x.shape[-1] == norm.weight.shape[0]:
             from ._triton_rms import fused_add_rms
 
@@ -567,7 +591,9 @@ class DecoderLayer(nn.Module):
         else:
             x = x + mixed
             normed = norm(x)
-        return x + self.mlp(normed)
+        output = self.mlp(normed)
+        self.mlp.postnorm_fp8_calls["native"] += 1
+        return x + output
 
 
 class TextModel(nn.Module):

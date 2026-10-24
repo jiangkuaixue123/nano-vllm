@@ -118,6 +118,34 @@ class FP8MergedLinear(FP8Linear):
             raise ValueError("Merged FP8 projections require distinct names and 128-aligned blocks")
         super().__init__(in_features, sum(self.out_sizes), device=device)
 
+    def _prepare_postnorm_fp8(self, device):
+        """Import the public entry; a complete eager call must precede capture."""
+        from ._postnorm_fp8 import projection_reason
+
+        reason = projection_reason(self, device)
+        if reason:
+            raise ValueError("Post-attention FP8 projection: " + reason)
+        with torch.cuda.device(device):
+            if (torch.cuda.is_current_stream_capturing()
+                    and getattr(self, "_postnorm_fp8_ready_device", None) != device):
+                raise RuntimeError("Warm the post-attention FP8 path eagerly before CUDA Graph capture")
+            from flashinfer.gemm import fp8_blockscale_gemm_sm90
+
+        return fp8_blockscale_gemm_sm90
+
+    def forward_prequantized(self, values, scales, input_shape):
+        """Source-private postnorm consumer; ordinary forward still accepts BF16."""
+        from ._postnorm_fp8 import validate_prequantized
+
+        validate_prequantized(self, values, scales, input_shape)
+        with torch.cuda.device(values.device):
+            gemm = self._prepare_postnorm_fp8(values.device)
+            result = gemm(values, self.weight, input_scale=scales,
+                          weight_scale=self.weight_scale_inv, out_dtype=torch.bfloat16)
+        self.kernel_calls["flashinfer"] += 1
+        self.native_fp8_calls += 1
+        return result.reshape(*input_shape[:-1], self.out_features).split(self.out_sizes, dim=-1)
+
     def part_ranges(self):
         start = 0
         ranges = {}
