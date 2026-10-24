@@ -9,12 +9,15 @@ These fused reductions change rounding; this is not an exact native oracle.
 import torch
 
 
-def prefill(query, key, value, decay, beta, initial):
+def prefill(query, key, value, decay, beta, initial, *, qk_norm_backend="native"):
     # Q/K may keep their original grouped heads; V, gates and state retain all
     # value heads. Normalization and the [K,V] <-> [V,K] state boundary are the
     # same for grouped and expanded inputs. Decode uses its separate adapter.
     # Optional CUDA dependency: importing the ordinary CPU model must not load it.
     from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
+    if qk_norm_backend not in ("native", "triton"):
+        raise ValueError("Unsupported GDN Q/K normalization backend")
 
     def normalized(x):
         work = x.float()
@@ -22,9 +25,14 @@ def prefill(query, key, value, decay, beta, initial):
 
     length = query.shape[1]
     state = None if initial is None else initial.transpose(-1, -2).contiguous()
+    prepared = None
+    if qk_norm_backend == "triton":
+        from ._gdn_qk_norm import normalize_pair
+
+        prepared = normalize_pair(query, key, qk_norm_backend)
     output, updated = chunk_gated_delta_rule(
-        q=normalized(query).squeeze(0).contiguous(),
-        k=normalized(key).squeeze(0).contiguous(),
+        q=(normalized(query) if prepared is None else prepared[0]).squeeze(0).contiguous(),
+        k=(normalized(key) if prepared is None else prepared[1]).squeeze(0).contiguous(),
         v=value.squeeze(0).contiguous(),
         g=decay.squeeze(0).float().exp().contiguous(),
         beta=beta.squeeze(0).float().contiguous(),

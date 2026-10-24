@@ -370,6 +370,13 @@ class DeltaNet(nn.Module):
             raise ValueError("Unsupported NANOVLLM_GDN_PREFILL_QK_LAYOUT")
         if self.gdn_prefill_qk_layout == "grouped" and self.gdn_backend != "flashinfer":
             raise ValueError("Grouped GDN prefill Q/K requires FlashInfer")
+        self.gdn_qk_norm_backend = os.environ.get("NANOVLLM_GDN_QK_NORM", "native")
+        if self.gdn_qk_norm_backend not in ("native", "triton"):
+            raise ValueError("Unsupported NANOVLLM_GDN_QK_NORM")
+        if self.gdn_qk_norm_backend == "triton" and (
+            self.gdn_backend != "flashinfer" or self.gdn_prefill_qk_layout != "grouped"
+        ):
+            raise ValueError("Triton whole Q/K normalization requires grouped FlashInfer prefill")
         if self.gdn_backend == "flashinfer" and (
             config.linear_key_head_dim != 128 or config.linear_value_head_dim != 128
         ):
@@ -466,9 +473,15 @@ class DeltaNet(nn.Module):
             else:
                 beta = b_lin.sigmoid()
                 decay = -self.A_log.float().exp() * F.softplus(a_lin.float() + self.dt_bias)
-                output, updated = _flashinfer_gdn.prefill(
-                    query, key, value, decay, beta, current
-                )
+                if self.gdn_qk_norm_backend == "triton":
+                    output, updated = _flashinfer_gdn.prefill(
+                        query, key, value, decay, beta, current,
+                        qk_norm_backend=self.gdn_qk_norm_backend,
+                    )
+                else:
+                    output, updated = _flashinfer_gdn.prefill(
+                        query, key, value, decay, beta, current
+                    )
         else:
             beta = b_lin.sigmoid()
             decay = -self.A_log.float().exp() * F.softplus(a_lin.float() + self.dt_bias)
