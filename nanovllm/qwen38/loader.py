@@ -57,7 +57,7 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError("Checkpoint index requires a nonempty weight map")
-    from .model import MLP, DeltaNet, FullAttention, FusedProjection
+    from .model import MLP, DecoderLayer, DeltaNet, FullAttention, FusedProjection
     from .quant import FP8Linear, FP8MergedLinear, fp8_report
 
     gdn_modules = [module for module in model.modules() if isinstance(module, DeltaNet)]
@@ -86,6 +86,10 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     if len(gdn_decode_a_logs) > 1:
         raise ValueError("Mixed GDN decode A_log cache modes are unsupported")
     parameters = dict(model.named_parameters())
+    input_norm_layers = [module for module in model.modules() if isinstance(module, DecoderLayer)]
+    input_norm_backends = {module.input_rms_fp8_backend for module in input_norm_layers}
+    if len(input_norm_backends) > 1:
+        raise ValueError("Mixed input RMS/FP8 backends are unsupported")
     mlps = [module for module in model.modules() if isinstance(module, MLP)]
     postnorm_backends = {module.postnorm_fp8_backend for module in mlps}
     if len(postnorm_backends) > 1:
@@ -218,6 +222,14 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
             "scope": "flashinfer_single_token_decode", "dtype": "float32",
             "cache": "nonpersistent_parameter_identity_and_version",
             "versionless_fallback": "original_cast", "execution_observed": False,
+        }
+    if input_norm_layers:
+        report["input_rms_fp8"] = {
+            "requested_backend": input_norm_backends.pop(), "layers": len(input_norm_layers),
+            "scope": "m1_input_rms_fp8", "norm_intermediate_dtype": "bfloat16",
+            "bf16_fanout_layers": sum(m.kind == "linear_attention" for m in input_norm_layers),
+            "quantizer": "fi_block128_fp32_scales", "scale_backing": [40, 4],
+            "fallback": "native_for_unsupported_operand_metadata", "execution_observed": False,
         }
     if mlps:
         report["postnorm_fp8"] = {

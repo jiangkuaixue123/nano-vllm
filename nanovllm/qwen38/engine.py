@@ -194,8 +194,20 @@ class DedicatedEngine:
                          "actual_dtypes_valid": all(module.weight.dtype == torch.float8_e4m3fn
                                                     and module.weight_scale_inv.dtype == torch.float32
                                                     for module in modules.values())}}
-            from .model import MLP, DeltaNet, FullAttention
+            from .model import MLP, DecoderLayer, DeltaNet, FullAttention
 
+            input_norms = {name: module for name, module in self.runner.model.named_modules()
+                           if isinstance(module, DecoderLayer)}
+            execution["input_rms_fp8_execution"] = {
+                "call_counter_scope": "python_input_pair_calls_excludes_graph_replay",
+                "per_module_calls": {name: dict(module.input_rms_fp8_calls)
+                                     for name, module in input_norms.items()},
+                "calls": {backend: sum(module.input_rms_fp8_calls[backend]
+                                       for module in input_norms.values())
+                          for backend in ("native", "triton")},
+                "candidate_kernel": "_input_rms_quant_kernel",
+                "consumer": "flashinfer.fp8_blockscale_gemm_sm90_prequantized",
+            }
             mlps = {name: module for name, module in self.runner.model.named_modules()
                     if isinstance(module, MLP)}
             execution["postnorm_fp8_execution"] = {
