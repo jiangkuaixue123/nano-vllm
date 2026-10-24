@@ -76,6 +76,9 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     gdn_qk_norms = {module.gdn_qk_norm_backend for module in gdn_modules}
     if len(gdn_qk_norms) > 1:
         raise ValueError("Mixed whole Q/K normalization backends are unsupported")
+    gdn_decode_a_logs = {module.gdn_decode_a_log for module in gdn_modules}
+    if len(gdn_decode_a_logs) > 1:
+        raise ValueError("Mixed GDN decode A_log cache modes are unsupported")
     parameters = dict(model.named_parameters())
     mlps = [module for module in model.modules() if isinstance(module, MLP)]
     postnorm_backends = {module.postnorm_fp8_backend for module in mlps}
@@ -190,6 +193,12 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
             "cross_backend_comparison": "diagnostic_reduction_order_differs",
             "fallback": "native_for_unsupported_operand_metadata",
             "decode": "unchanged", "execution_observed": False,
+        }
+        report["gdn_decode_a_log"] = {
+            "mode": gdn_decode_a_logs.pop(), "layers": len(gdn_modules),
+            "scope": "flashinfer_single_token_decode", "dtype": "float32",
+            "cache": "nonpersistent_parameter_identity_and_version",
+            "versionless_fallback": "original_cast", "execution_observed": False,
         }
     if mlps:
         report["postnorm_fp8"] = {
