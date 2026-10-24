@@ -180,6 +180,11 @@ class FullAttention(nn.Module):
         self.prefill_attention = os.environ.get("NANOVLLM_PREFILL_ATTENTION", "native")
         if self.prefill_attention not in ("native", "sdpa_flash", "flashinfer_fa3"):
             raise ValueError(f"Unsupported NANOVLLM_PREFILL_ATTENTION: {self.prefill_attention}")
+        self.decode_attention = os.environ.get("NANOVLLM_GATED_DECODE_ATTENTION", "native")
+        if self.decode_attention not in ("native", "triton_split"):
+            raise ValueError("Unsupported NANOVLLM_GATED_DECODE_ATTENTION")
+        self.gated_decode_calls = {"native": 0, "triton_split": 0}
+        self.gated_decode_last_route = None
         q_size = config.num_attention_heads * config.head_dim
         kv_size = config.num_key_value_heads * config.head_dim
         self.q_proj = nn.Linear(config.hidden_size, q_size * 2, bias=False)
@@ -210,6 +215,17 @@ class FullAttention(nn.Module):
             q, k = paired_partial_rope(q, k, cos, sin)
         else:
             q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        decode_kernel = None
+        if self.decode_attention != "native":
+            from ._gated_attention_decode import execution, prepare
+
+            self.gated_decode_last_route = execution(
+                q, state.key, state.value, gate, positions, self.decode_attention,
+                capacity=state.capacity, fresh_prefill=fresh_prefill,
+            )
+            if self.gated_decode_last_route["selected_backend"] == "triton_split":
+                # Cold-capture/import failures precede request-owned KV writes.
+                decode_kernel = prepare(self, q)
         if state.capacity:
             index = positions.reshape(-1)
             state.key.index_copy_(2, index, k)
@@ -219,6 +235,13 @@ class FullAttention(nn.Module):
                 k = torch.cat((state.key, k), dim=2)
                 v = torch.cat((state.value, v), dim=2)
             state.key, state.value = k, v
+        if decode_kernel is not None:
+            result = decode_kernel(q, state.key, state.value, gate, positions)
+            self._gated_decode_ready_device = q.device
+            self.gated_decode_calls["triton_split"] += 1
+            self.gated_decode_last_route["execution_observed"] = True
+            return self.o_proj(result)
+        self.gated_decode_calls["native"] += 1
         if fresh_prefill and self.prefill_attention == "sdpa_flash":
             result = flash_prefill(q, k, v).transpose(1, 2).reshape(1, count, -1)
             return self.o_proj(result * gate.sigmoid())

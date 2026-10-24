@@ -19,3 +19,13 @@ https://huggingface.co/kernels/kernels-community/finegrained-fp8/tree/0e5764aa5c
 Modifications specialize dynamic activation quantization, fixed launch geometry
 and FP32 accumulation for the dedicated text engine; no Hub kernel download or
 Transformers model execution is required by the native runtime.
+
+The experimental gated decode attention kernel adapts grouped stage1/stage2
+flash decoding from SGLang, Copyright 2023-2024 SGLang Team, Apache-2.0:
+https://github.com/sgl-project/sglang/blob/406786fd910dd82d03d1ce2c2e4c08b547786bc2/python/sglang/kernels/ops/attention/decode_attention.py
+That source declares ancestry in LightLLM's gqa_flash_decoding_stage1.py and
+gqa_flash_decoding_stage2.py at commit
+96353e868a840db4d103138caf15ed9dbea8c186.
+Modifications specialize a direct BF16 KV cache, one-token 24/4-head attention,
+fixed split geometry, device live-length masking, BF16 score boundaries and a
+BF16 sigmoid gate epilogue. No SGLang package is imported or executed.
