@@ -194,7 +194,7 @@ class DedicatedEngine:
                          "actual_dtypes_valid": all(module.weight.dtype == torch.float8_e4m3fn
                                                     and module.weight_scale_inv.dtype == torch.float32
                                                     for module in modules.values())}}
-            from .model import MLP
+            from .model import MLP, DeltaNet
 
             mlps = {name: module for name, module in self.runner.model.named_modules()
                     if isinstance(module, MLP)}
@@ -212,6 +212,16 @@ class DedicatedEngine:
                 "calls": {backend: sum(module.silu_fp8_calls[backend] for module in mlps.values())
                           for backend in ("native", "triton")},
                 "candidate_kernel": "_silu_mul_quant_kernel",
+                "consumer": "flashinfer.fp8_blockscale_gemm_sm90_prequantized",
+            }
+            gdn = {name: module for name, module in self.runner.model.named_modules()
+                   if isinstance(module, DeltaNet)}
+            execution["gdn_outnorm_fp8_execution"] = {
+                "call_counter_scope": "python_producer_output_calls_excludes_graph_replay",
+                "per_module_calls": {name: dict(module.outnorm_fp8_calls) for name, module in gdn.items()},
+                "calls": {backend: sum(module.outnorm_fp8_calls[backend] for module in gdn.values())
+                          for backend in ("native", "triton")},
+                "candidate_kernel": "_outnorm_quant_kernel",
                 "consumer": "flashinfer.fp8_blockscale_gemm_sm90_prequantized",
             }
         return {"model_id": self.model_id, "precision": self.loader_report["dtype"],

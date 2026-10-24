@@ -95,6 +95,33 @@ class FP8Linear(nn.Module):
         self.native_fp8_calls += 1
         return result.reshape(*input_shape[:-1], self.out_features)
 
+    def _prepare_gdn_outnorm_fp8(self, device):
+        """Private M1 GDN output projection; warm the full bridge before capture."""
+        from ._gdn_outnorm_fp8 import projection_reason
+
+        reason = projection_reason(self, device)
+        if reason:
+            raise ValueError("GDN output FP8 projection: " + reason)
+        with torch.cuda.device(device):
+            if (torch.cuda.is_current_stream_capturing()
+                    and getattr(self, "_gdn_outnorm_fp8_ready_device", None) != device):
+                raise RuntimeError("Warm the GDN output norm FP8 path eagerly before CUDA Graph capture")
+            from flashinfer.gemm import fp8_blockscale_gemm_sm90
+
+        return fp8_blockscale_gemm_sm90
+
+    def _forward_gdn_outnorm_prequantized(self, values, scales, input_shape):
+        from ._gdn_outnorm_fp8 import validate_prequantized
+
+        validate_prequantized(self, values, scales, input_shape)
+        with torch.cuda.device(values.device):
+            gemm = self._prepare_gdn_outnorm_fp8(values.device)
+            result = gemm(values, self.weight, input_scale=scales,
+                          weight_scale=self.weight_scale_inv, out_dtype=torch.bfloat16)
+        self.kernel_calls["flashinfer"] += 1
+        self.native_fp8_calls += 1
+        return result.reshape(*input_shape[:-1], self.out_features)
+
     def _matmul(self, inputs: torch.Tensor) -> torch.Tensor:
         # Match vLLM's small-M SM90 choice; prefill follows the selected backend.
         # FlashInfer's BF16 input path quantizes activations internally.
