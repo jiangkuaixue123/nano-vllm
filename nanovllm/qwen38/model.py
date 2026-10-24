@@ -429,6 +429,10 @@ class DeltaNet(nn.Module):
         )
         self.dt_bias = nn.Parameter(torch.ones(config.linear_num_value_heads))
         self.A_log = nn.Parameter(torch.zeros(config.linear_num_value_heads))
+        self.outnorm_fp8_backend = os.environ.get("NANOVLLM_GDN_OUTNORM_FP8", "native")
+        if self.outnorm_fp8_backend not in ("native", "triton"):
+            raise ValueError(f"Unsupported NANOVLLM_GDN_OUTNORM_FP8: {self.outnorm_fp8_backend}")
+        self.outnorm_fp8_calls = {"native": 0, "triton": 0}
         self.norm = GatedRMSNorm(config.linear_value_head_dim, config.rms_norm_eps)
         self.out_proj = nn.Linear(self.value_dim, config.hidden_size, bias=False)
 
@@ -548,8 +552,24 @@ class DeltaNet(nn.Module):
         else:
             state.recurrent = updated
         state.fresh = False
-        output = self.norm(output, gate).reshape(1, count, self.value_dim)
-        return self.out_proj(output)
+        return self._forward_outnorm(output, gate)
+
+    def outnorm_fp8_execution(self, output, gate):
+        from ._gdn_outnorm_fp8 import execution
+
+        return execution(output, gate, self.norm, self.out_proj, self.outnorm_fp8_backend)
+
+    def _forward_outnorm(self, output, gate):
+        if self.outnorm_fp8_backend == "triton" and self.outnorm_fp8_execution(output, gate)["selected_backend"] == "triton":
+            from ._gdn_outnorm_fp8 import outnorm_fp8_output
+
+            result = outnorm_fp8_output(output, gate, self.norm, self.out_proj)
+            self.outnorm_fp8_calls["triton"] += 1
+            return result
+        normed = self.norm(output, gate).reshape(1, gate.shape[1], self.value_dim)
+        result = self.out_proj(normed)
+        self.outnorm_fp8_calls["native"] += 1
+        return result
 
 
 class MLP(nn.Module):

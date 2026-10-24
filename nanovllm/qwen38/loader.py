@@ -69,6 +69,9 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     outnorm_backends = {module.norm.outnorm_backend for module in gdn_modules}
     if len(outnorm_backends) > 1:
         raise ValueError("Mixed GDN output norm backends are unsupported")
+    outnorm_fp8_backends = {module.outnorm_fp8_backend for module in gdn_modules}
+    if len(outnorm_fp8_backends) > 1:
+        raise ValueError("Mixed GDN output norm FP8 backends are unsupported")
     gdn_convolutions = {(module.gdn_conv_backend, module.config.linear_conv_kernel_dim)
                         for module in gdn_modules}
     if len(gdn_convolutions) > 1:
@@ -192,6 +195,13 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
         report["gdn_outnorm"] = {
             "backend": outnorm_backends.pop(), "layers": len(gdn_modules),
             "norm_intermediate_dtype": "bfloat16", "silu_intermediate_dtype": "bfloat16",
+        }
+        report["gdn_outnorm_fp8"] = {
+            "requested_backend": outnorm_fp8_backends.pop(), "layers": len(gdn_modules),
+            "scope": "m1_gdn_outnorm_fp8_output", "norm_intermediate_dtype": "bfloat16",
+            "silu_intermediate_dtype": "bfloat16", "product_intermediate_dtype": "bfloat16",
+            "quantizer": "fi_block128_fp32_scales", "scale_backing": [48, 4],
+            "fallback": "native_for_unsupported_operand_metadata", "execution_observed": False,
         }
         report["gdn_qk_normalization"] = {
             "requested_backend": gdn_qk_norms.pop(), "layers": len(gdn_modules),
