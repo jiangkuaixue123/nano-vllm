@@ -164,7 +164,7 @@ class FullAttention(nn.Module):
         if self.rope_backend not in ("native", "triton"):
             raise ValueError(f"Unsupported NANOVLLM_FULL_ROPE: {self.rope_backend}")
         self.prefill_attention = os.environ.get("NANOVLLM_PREFILL_ATTENTION", "native")
-        if self.prefill_attention not in ("native", "sdpa_flash"):
+        if self.prefill_attention not in ("native", "sdpa_flash", "flashinfer_fa3"):
             raise ValueError(f"Unsupported NANOVLLM_PREFILL_ATTENTION: {self.prefill_attention}")
         q_size = config.num_attention_heads * config.head_dim
         kv_size = config.num_key_value_heads * config.head_dim
@@ -207,6 +207,11 @@ class FullAttention(nn.Module):
             state.key, state.value = k, v
         if fresh_prefill and self.prefill_attention == "sdpa_flash":
             result = flash_prefill(q, k, v).transpose(1, 2).reshape(1, count, -1)
+            return self.o_proj(result * gate.sigmoid())
+        if fresh_prefill and self.prefill_attention == "flashinfer_fa3":
+            from ._flashinfer_attention import flashinfer_fa3_prefill
+
+            result = flashinfer_fa3_prefill(q, k, v).transpose(1, 2).reshape(1, count, -1)
             return self.o_proj(result * gate.sigmoid())
         kv_heads = config.num_key_value_heads
         repeats = config.num_attention_heads // kv_heads

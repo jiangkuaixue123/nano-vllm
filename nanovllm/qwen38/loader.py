@@ -82,6 +82,9 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     rope_backends = {module.rope_backend for module in full_attention}
     if len(rope_backends) > 1:
         raise ValueError("Mixed full-attention RoPE backends are unsupported")
+    prefill_backends = {module.prefill_attention for module in full_attention}
+    if len(prefill_backends) > 1:
+        raise ValueError("Mixed full-attention prefill backends are unsupported")
     # 融合后的投影只有一份权重：把 checkpoint 里的 q_proj/k_proj/v_proj 等
     # 映射到这份权重的行切片视图上，加载时直接原地写入，不额外占显存。
     fused = [(name, module) for name, module in model.named_modules()
@@ -181,6 +184,10 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
             "silu_intermediate_dtype": "bfloat16",
         }
     if full_attention:
+        report["full_attention_prefill"] = {
+            "backend": prefill_backends.pop(), "layers": len(full_attention),
+            "scope": "fresh_prefill", "cached_continuation": "native",
+        }
         report["full_attention_rope"] = {
             "backend": rope_backends.pop(), "layers": len(full_attention),
             "scope": "postnorm_partial_rope", "norm_backend": "native",
