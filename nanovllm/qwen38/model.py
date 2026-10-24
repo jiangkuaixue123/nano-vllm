@@ -374,6 +374,11 @@ class DeltaNet(nn.Module):
         self.gdn_backend = os.environ.get("NANOVLLM_GDN", "native")
         if self.gdn_backend not in ("native", "flashinfer"):
             raise ValueError(f"Unsupported NANOVLLM_GDN: {self.gdn_backend}")
+        self.gdn_decode_a_log = os.environ.get("NANOVLLM_GDN_DECODE_A_LOG", "native")
+        if self.gdn_decode_a_log not in ("native", "cached_fp32"):
+            raise ValueError("Unsupported NANOVLLM_GDN_DECODE_A_LOG")
+        if self.gdn_decode_a_log != "native" and self.gdn_backend != "flashinfer":
+            raise ValueError("Cached decode A_log requires FlashInfer GDN")
         self.gdn_conv_backend = os.environ.get("NANOVLLM_GDN_CONV", "native")
         if self.gdn_conv_backend not in ("native", "triton"):
             raise ValueError("Unsupported NANOVLLM_GDN_CONV")
@@ -384,6 +389,14 @@ class DeltaNet(nn.Module):
             raise ValueError("Unsupported NANOVLLM_GDN_PREFILL_QK_LAYOUT")
         if self.gdn_prefill_qk_layout == "grouped" and self.gdn_backend != "flashinfer":
             raise ValueError("Grouped GDN prefill Q/K requires FlashInfer")
+        self.gdn_decode_qk_layout = os.environ.get("NANOVLLM_GDN_DECODE_QK_LAYOUT", "expanded")
+        if self.gdn_decode_qk_layout not in ("expanded", "grouped"):
+            raise ValueError("Unsupported NANOVLLM_GDN_DECODE_QK_LAYOUT")
+        if self.gdn_decode_qk_layout == "grouped" and (
+            self.gdn_backend != "flashinfer"
+            or config.linear_num_key_heads != 16 or config.linear_num_value_heads != 48
+        ):
+            raise ValueError("Grouped GDN decode requires FlashInfer with 16 Q/K and 48 value heads")
         self.gdn_qk_norm_backend = os.environ.get("NANOVLLM_GDN_QK_NORM", "native")
         if self.gdn_qk_norm_backend not in ("native", "triton"):
             raise ValueError("Unsupported NANOVLLM_GDN_QK_NORM")
@@ -419,8 +432,33 @@ class DeltaNet(nn.Module):
         self.norm = GatedRMSNorm(config.linear_value_head_dim, config.rms_norm_eps)
         self.out_proj = nn.Linear(self.value_dim, config.hidden_size, bias=False)
 
+    def _decode_a_log(self):
+        weight = self.A_log
+        # Versionless inference tensors cannot support mutation-aware reuse.
+        try:
+            version = weight._version
+        except RuntimeError:
+            return weight
+        identity = (id(weight), version, weight.device, weight.dtype,
+                    tuple(weight.shape), tuple(weight.stride()), weight.data_ptr())
+        cached = getattr(self, "_decode_a_log_fp32", None)
+        if (getattr(self, "_decode_a_log_identity", None) == identity
+                and cached is not None and cached.device == weight.device
+                and cached.dtype == torch.float32):
+            return cached
+        # Called before projections/convolution mutate request-owned buffers.
+        if weight.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Warm cached GDN decode A_log before CUDA Graph capture")
+        self.register_buffer("_decode_a_log_fp32", weight.detach().float(), persistent=False)
+        self._decode_a_log_identity = identity
+        return self._decode_a_log_fp32
+
     def forward(self, x, state):
         config, count = self.config, x.shape[1]
+        decode_a_log = self.A_log
+        if (self.gdn_decode_a_log == "cached_fp32" and count == 1
+                and state.conv is not None and not state.fresh):
+            decode_a_log = self._decode_a_log()
         if hasattr(self, "in_proj_fused"):
             qkv_lin, z_lin, b_lin, a_lin = self.in_proj_fused(x)
         else:
@@ -469,8 +507,12 @@ class DeltaNet(nn.Module):
         repeats = config.linear_num_value_heads // config.linear_num_key_heads
         # FlashInfer prefill accepts grouped-value attention: output head h uses
         # Q/K head h // repeats. Normalize each original head once in the bridge.
-        # Single-token decode and the default/native paths retain expanded heads.
-        if self.gdn_prefill_qk_layout == "expanded" or (previous and count == 1):
+        # The decode kernel uses the same head mapping. Its grouped layout is
+        # separately opt-in; fresh and cached multi-token calls keep prefill policy.
+        decode_layout = self.gdn_decode_qk_layout if previous and count == 1 else None
+        if decode_layout == "expanded" or (
+            decode_layout is None and self.gdn_prefill_qk_layout == "expanded"
+        ):
             query, key = (
                 query.repeat_interleave(repeats, 2),
                 key.repeat_interleave(repeats, 2),
@@ -482,7 +524,7 @@ class DeltaNet(nn.Module):
             if previous and count == 1:
                 output, updated = _flashinfer_gdn.decode(
                     query, key, value, current if buffered else current.clone(),
-                    self.A_log, a_lin, self.dt_bias, b_lin
+                    decode_a_log, a_lin, self.dt_bias, b_lin
                 )
             else:
                 beta = b_lin.sigmoid()
