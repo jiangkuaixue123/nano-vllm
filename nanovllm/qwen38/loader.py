@@ -103,6 +103,9 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     prefill_backends = {module.prefill_attention for module in full_attention}
     if len(prefill_backends) > 1:
         raise ValueError("Mixed full-attention prefill backends are unsupported")
+    decode_backends = {module.decode_attention for module in full_attention}
+    if len(decode_backends) > 1:
+        raise ValueError("Mixed gated decode attention backends are unsupported")
     # 融合后的投影只有一份权重：把 checkpoint 里的 q_proj/k_proj/v_proj 等
     # 映射到这份权重的行切片视图上，加载时直接原地写入，不额外占显存。
     fused = [(name, module) for name, module in model.named_modules()
@@ -234,6 +237,13 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
             "fallback": "native_for_unsupported_operand_metadata", "execution_observed": False,
         }
     if full_attention:
+        report["gated_decode_attention"] = {
+            "requested_backend": decode_backends.pop(), "layers": len(full_attention),
+            "scope": "single_token_gqa24_kv4_d256_capacity10240",
+            "fallback": "native_for_unsupported_metadata", "execution_observed": False,
+            "kv_dtype": "bfloat16", "split_count": 32,
+            "cross_native_bit_exact": False,
+        }
         report["full_attention_prefill"] = {
             "backend": prefill_backends.pop(), "layers": len(full_attention),
             "scope": "fresh_prefill", "cached_continuation": "native",

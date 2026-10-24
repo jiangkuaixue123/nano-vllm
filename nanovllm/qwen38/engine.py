@@ -194,7 +194,7 @@ class DedicatedEngine:
                          "actual_dtypes_valid": all(module.weight.dtype == torch.float8_e4m3fn
                                                     and module.weight_scale_inv.dtype == torch.float32
                                                     for module in modules.values())}}
-            from .model import MLP, DeltaNet
+            from .model import MLP, DeltaNet, FullAttention
 
             mlps = {name: module for name, module in self.runner.model.named_modules()
                     if isinstance(module, MLP)}
@@ -223,6 +223,15 @@ class DedicatedEngine:
                           for backend in ("native", "triton")},
                 "candidate_kernel": "_outnorm_quant_kernel",
                 "consumer": "flashinfer.fp8_blockscale_gemm_sm90_prequantized",
+            }
+            attention = {name: module for name, module in self.runner.model.named_modules()
+                         if isinstance(module, FullAttention)}
+            execution["gated_decode_attention_execution"] = {
+                "call_counter_scope": "python_attention_calls_includes_prefill_excludes_graph_replay",
+                "per_module_calls": {name: dict(module.gated_decode_calls)
+                                     for name, module in attention.items()},
+                "last_routes": {name: module.gated_decode_last_route
+                                for name, module in attention.items()},
             }
         return {"model_id": self.model_id, "precision": self.loader_report["dtype"],
                 "prefill_logits": getattr(self.runner, "prefill_logits", "all"),
