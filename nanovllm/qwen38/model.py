@@ -559,6 +559,10 @@ class MLP(nn.Module):
         if self.postnorm_fp8_backend not in ("native", "triton"):
             raise ValueError(f"Unsupported NANOVLLM_POSTNORM_FP8: {self.postnorm_fp8_backend}")
         self.postnorm_fp8_calls = {"native": 0, "triton": 0}
+        self.silu_fp8_backend = os.environ.get("NANOVLLM_SILU_FP8", "native")
+        if self.silu_fp8_backend not in ("native", "triton"):
+            raise ValueError(f"Unsupported NANOVLLM_SILU_FP8: {self.silu_fp8_backend}")
+        self.silu_fp8_calls = {"native": 0, "triton": 0}
         self.activation_backend = os.environ.get("NANOVLLM_MLP_ACTIVATION", "native")
         if self.activation_backend not in ("native", "triton"):
             raise ValueError(f"Unsupported NANOVLLM_MLP_ACTIVATION: {self.activation_backend}")
@@ -604,14 +608,28 @@ class MLP(nn.Module):
         self.postnorm_fp8_calls[selected] += 1
         return residual, gate, up
 
+    def silu_fp8_execution(self, gate, up):
+        from ._silu_fp8 import execution
+
+        return execution(gate, up, self.down_proj, self.silu_fp8_backend, self.activation_backend)
+
     def _forward_gate_up(self, gate, up):
+        if self.silu_fp8_backend == "triton" and self.silu_fp8_execution(gate, up)["selected_backend"] == "triton":
+            from ._silu_fp8 import silu_fp8_down
+
+            result = silu_fp8_down(gate, up, self.down_proj)
+            self.silu_fp8_calls["triton"] += 1
+            return result
         if self.activation_backend == "triton":
             if gate.device.type != "cuda" or torch.version.hip is not None:
                 raise ValueError("Triton MLP activation requires NVIDIA CUDA")
             from ._triton_silu import silu_and_mul
 
-            return self.down_proj(silu_and_mul(gate, up))
-        return self.down_proj(F.silu(gate) * up)
+            result = self.down_proj(silu_and_mul(gate, up))
+        else:
+            result = self.down_proj(F.silu(gate) * up)
+        self.silu_fp8_calls["native"] += 1
+        return result
 
 
 class DecoderLayer(nn.Module):

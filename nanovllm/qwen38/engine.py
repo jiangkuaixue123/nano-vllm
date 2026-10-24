@@ -206,6 +206,14 @@ class DedicatedEngine:
                 "candidate_kernel": "_add_rms_quant_kernel",
                 "consumer": "flashinfer.fp8_blockscale_gemm_sm90_prequantized",
             }
+            execution["silu_fp8_execution"] = {
+                "call_counter_scope": "python_producer_down_calls_excludes_graph_replay",
+                "per_module_calls": {name: dict(module.silu_fp8_calls) for name, module in mlps.items()},
+                "calls": {backend: sum(module.silu_fp8_calls[backend] for module in mlps.values())
+                          for backend in ("native", "triton")},
+                "candidate_kernel": "_silu_mul_quant_kernel",
+                "consumer": "flashinfer.fp8_blockscale_gemm_sm90_prequantized",
+            }
         return {"model_id": self.model_id, "precision": self.loader_report["dtype"],
                 "prefill_logits": getattr(self.runner, "prefill_logits", "all"),
                 "graph_prewarm": getattr(self, "prewarm_report", {}),
