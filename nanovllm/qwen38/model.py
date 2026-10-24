@@ -63,6 +63,11 @@ class FusedProjection(nn.Module):
         self.out_sizes = tuple(int(x) for x in out_sizes)
         self.names = tuple(names)
         assert len(self.names) == len(self.out_sizes)
+        self.ba_gemv = (os.environ.get("NANOVLLM_GDN_BA_GEMV", "native")
+                        if self.names == ("in_proj_b", "in_proj_a") else "native")
+        if self.ba_gemv not in ("native", "triton"):
+            raise ValueError(f"Unsupported NANOVLLM_GDN_BA_GEMV={self.ba_gemv!r}")
+        self._ba_gemv_ready_device = None
         self.weight = nn.Parameter(
             torch.empty(sum(self.out_sizes), self.in_features, device=device, dtype=dtype)
         )
@@ -75,6 +80,15 @@ class FusedProjection(nn.Module):
         return ranges
 
     def forward(self, x):
+        if self.ba_gemv == "triton" and x.numel() == self.in_features:
+            if (x.device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+                    and self._ba_gemv_ready_device != x.device):
+                raise RuntimeError("Warm BF16 b/a GEMV eagerly before CUDA Graph capture")
+            from ._triton_ba_gemv import gemv
+
+            output = gemv(x, self.weight)
+            self._ba_gemv_ready_device = x.device
+            return output.split(self.out_sizes, dim=-1)
         return F.linear(x, self.weight).split(self.out_sizes, dim=-1)
 
 
