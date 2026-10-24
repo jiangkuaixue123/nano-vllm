@@ -194,6 +194,18 @@ class DedicatedEngine:
                          "actual_dtypes_valid": all(module.weight.dtype == torch.float8_e4m3fn
                                                     and module.weight_scale_inv.dtype == torch.float32
                                                     for module in modules.values())}}
+            from .model import MLP
+
+            mlps = {name: module for name, module in self.runner.model.named_modules()
+                    if isinstance(module, MLP)}
+            execution["postnorm_fp8_execution"] = {
+                "call_counter_scope": "python_producer_gate_up_calls_excludes_graph_replay",
+                "per_module_calls": {name: dict(module.postnorm_fp8_calls) for name, module in mlps.items()},
+                "calls": {backend: sum(module.postnorm_fp8_calls[backend] for module in mlps.values())
+                          for backend in ("native", "triton")},
+                "candidate_kernel": "_add_rms_quant_kernel",
+                "consumer": "flashinfer.fp8_blockscale_gemm_sm90_prequantized",
+            }
         return {"model_id": self.model_id, "precision": self.loader_report["dtype"],
                 "prefill_logits": getattr(self.runner, "prefill_logits", "all"),
                 "graph_prewarm": getattr(self, "prewarm_report", {}),

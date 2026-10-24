@@ -78,6 +78,9 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
         raise ValueError("Mixed whole Q/K normalization backends are unsupported")
     parameters = dict(model.named_parameters())
     mlps = [module for module in model.modules() if isinstance(module, MLP)]
+    postnorm_backends = {module.postnorm_fp8_backend for module in mlps}
+    if len(postnorm_backends) > 1:
+        raise ValueError("Mixed post-attention FP8 backends are unsupported")
     activation_backends = {module.activation_backend for module in mlps}
     if len(activation_backends) > 1:
         raise ValueError("Mixed MLP activation backends are unsupported")
@@ -189,6 +192,12 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
             "decode": "unchanged", "execution_observed": False,
         }
     if mlps:
+        report["postnorm_fp8"] = {
+            "requested_backend": postnorm_backends.pop(), "layers": len(mlps),
+            "scope": "m1_post_attention_gate_up", "norm_intermediate_dtype": "bfloat16",
+            "quantizer": "fi_block128_fp32_scales", "scale_backing": [40, 4],
+            "fallback": "native_for_unsupported_operand_metadata", "execution_observed": False,
+        }
         report["mlp_activation"] = {
             "backend": activation_backends.pop(), "layers": len(mlps),
             "silu_intermediate_dtype": "bfloat16",
