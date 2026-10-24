@@ -76,6 +76,9 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
     gdn_qk_norms = {module.gdn_qk_norm_backend for module in gdn_modules}
     if len(gdn_qk_norms) > 1:
         raise ValueError("Mixed whole Q/K normalization backends are unsupported")
+    gdn_decode_layouts = {module.gdn_decode_qk_layout for module in gdn_modules}
+    if len(gdn_decode_layouts) > 1:
+        raise ValueError("Mixed GDN decode Q/K layouts are unsupported")
     gdn_decode_a_logs = {module.gdn_decode_a_log for module in gdn_modules}
     if len(gdn_decode_a_logs) > 1:
         raise ValueError("Mixed GDN decode A_log cache modes are unsupported")
@@ -181,7 +184,7 @@ def load_weights(model: torch.nn.Module, model_path: str | Path) -> dict:
         report["gdn_prefill"] = {
             "backend": backend, "qk_layout": layout, "layers": len(gdn_modules),
             "query_key_heads": key_heads if layout == "grouped" else value_heads,
-            "value_heads": value_heads, "decode_qk_layout": "expanded",
+            "value_heads": value_heads, "decode_qk_layout": gdn_decode_layouts.pop(),
         }
         report["gdn_outnorm"] = {
             "backend": outnorm_backends.pop(), "layers": len(gdn_modules),

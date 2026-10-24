@@ -375,6 +375,14 @@ class DeltaNet(nn.Module):
             raise ValueError("Unsupported NANOVLLM_GDN_PREFILL_QK_LAYOUT")
         if self.gdn_prefill_qk_layout == "grouped" and self.gdn_backend != "flashinfer":
             raise ValueError("Grouped GDN prefill Q/K requires FlashInfer")
+        self.gdn_decode_qk_layout = os.environ.get("NANOVLLM_GDN_DECODE_QK_LAYOUT", "expanded")
+        if self.gdn_decode_qk_layout not in ("expanded", "grouped"):
+            raise ValueError("Unsupported NANOVLLM_GDN_DECODE_QK_LAYOUT")
+        if self.gdn_decode_qk_layout == "grouped" and (
+            self.gdn_backend != "flashinfer"
+            or config.linear_num_key_heads != 16 or config.linear_num_value_heads != 48
+        ):
+            raise ValueError("Grouped GDN decode requires FlashInfer with 16 Q/K and 48 value heads")
         self.gdn_qk_norm_backend = os.environ.get("NANOVLLM_GDN_QK_NORM", "native")
         if self.gdn_qk_norm_backend not in ("native", "triton"):
             raise ValueError("Unsupported NANOVLLM_GDN_QK_NORM")
@@ -485,8 +493,12 @@ class DeltaNet(nn.Module):
         repeats = config.linear_num_value_heads // config.linear_num_key_heads
         # FlashInfer prefill accepts grouped-value attention: output head h uses
         # Q/K head h // repeats. Normalize each original head once in the bridge.
-        # Single-token decode and the default/native paths retain expanded heads.
-        if self.gdn_prefill_qk_layout == "expanded" or (previous and count == 1):
+        # The decode kernel uses the same head mapping. Its grouped layout is
+        # separately opt-in; fresh and cached multi-token calls keep prefill policy.
+        decode_layout = self.gdn_decode_qk_layout if previous and count == 1 else None
+        if decode_layout == "expanded" or (
+            decode_layout is None and self.gdn_prefill_qk_layout == "expanded"
+        ):
             query, key = (
                 query.repeat_interleave(repeats, 2),
                 key.repeat_interleave(repeats, 2),
