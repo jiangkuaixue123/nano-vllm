@@ -200,6 +200,33 @@ class FP8MergedLinear(FP8Linear):
         self.native_fp8_calls += 1
         return result.reshape(*input_shape[:-1], self.out_features).split(self.out_sizes, dim=-1)
 
+    def _prepare_input_rms_fp8(self, device, keep_bf16):
+        from ._input_rms_fp8 import projection_reason
+
+        reason = projection_reason(self, device, keep_bf16)
+        if reason:
+            raise ValueError("Input RMS/FP8 projection: " + reason)
+        with torch.cuda.device(device):
+            if (torch.cuda.is_current_stream_capturing()
+                    and getattr(self, "_input_rms_fp8_ready_device", None) != device):
+                raise RuntimeError("Warm the complete input RMS/FP8 pair before capture")
+            from flashinfer.gemm import fp8_blockscale_gemm_sm90
+
+        return fp8_blockscale_gemm_sm90
+
+    def _forward_input_prequantized(self, values, scales, input_shape, keep_bf16):
+        """Source-private QKV/QKVZ consumer; the H2 gate/up contract stays separate."""
+        from ._input_rms_fp8 import validate_prequantized
+
+        validate_prequantized(self, values, scales, input_shape, keep_bf16)
+        with torch.cuda.device(values.device):
+            gemm = self._prepare_input_rms_fp8(values.device, keep_bf16)
+            result = gemm(values, self.weight, input_scale=scales,
+                          weight_scale=self.weight_scale_inv, out_dtype=torch.bfloat16)
+        self.kernel_calls["flashinfer"] += 1
+        self.native_fp8_calls += 1
+        return result.reshape(*input_shape[:-1], self.out_features).split(self.out_sizes, dim=-1)
+
     def part_ranges(self):
         start = 0
         ranges = {}

@@ -194,11 +194,14 @@ class FullAttention(nn.Module):
         self.q_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
 
-    def forward(self, x, state, positions, cos, sin, *, fresh_prefill=False):
+    def forward(self, x, state, positions, cos, sin, *, fresh_prefill=False,
+                _input_projection=None):
         config = self.config
         count = x.shape[1]
         # Q and gate are interleaved per head, not two contiguous projection halves.
-        if hasattr(self, "qkv_proj"):
+        if _input_projection is not None:
+            q_lin, k_lin, v_lin = _input_projection
+        elif hasattr(self, "qkv_proj"):
             q_lin, k_lin, v_lin = self.qkv_proj(x)
         else:
             q_lin, k_lin, v_lin = self.q_proj(x), self.k_proj(x), self.v_proj(x)
@@ -480,7 +483,7 @@ class DeltaNet(nn.Module):
         self._decode_a_log_identity = identity
         return self._decode_a_log_fp32
 
-    def forward(self, x, state):
+    def forward(self, x, state, *, _input_projection=None):
         config, count = self.config, x.shape[1]
         decode_a_log = self.A_log
         if (self.gdn_decode_a_log == "cached_fp32" and count == 1
@@ -489,7 +492,9 @@ class DeltaNet(nn.Module):
         if hasattr(self, "in_proj_fused"):
             qkv_lin, z_lin, b_lin, a_lin = self.in_proj_fused(x)
         else:
-            if hasattr(self, "in_proj_qkvz"):
+            if _input_projection is not None:
+                qkv_lin, z_lin = _input_projection
+            elif hasattr(self, "in_proj_qkvz"):
                 qkv_lin, z_lin = self.in_proj_qkvz(x)
             else:
                 qkv_lin, z_lin = self.in_proj_qkv(x), self.in_proj_z(x)
@@ -684,17 +689,55 @@ class DecoderLayer(nn.Module):
         else:
             self.self_attn = FullAttention(config)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.input_rms_fp8_backend = os.environ.get("NANOVLLM_INPUT_RMS_FP8", "native")
+        if self.input_rms_fp8_backend not in ("native", "triton"):
+            raise ValueError("Unsupported NANOVLLM_INPUT_RMS_FP8")
+        self.input_rms_fp8_calls = {"native": 0, "triton": 0}
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mlp = MLP(config)
 
-    def forward(self, x, state, positions, cos, sin, *, fresh_prefill=False):
+    def input_rms_fp8_execution(self, x, *, fresh_prefill=False):
+        from ._input_rms_fp8 import execution
+
+        gdn = self.kind == "linear_attention"
+        owner = self.linear_attn if gdn else self.self_attn
+        projection = getattr(owner, "in_proj_qkvz" if gdn else "qkv_proj", None)
+        if gdn and hasattr(owner, "in_proj_fused"):
+            projection = None
+        return execution(x, self.input_layernorm, projection, self.input_rms_fp8_backend,
+                         keep_bf16=gdn, fresh_prefill=fresh_prefill)
+
+    def _forward_input(self, x, *, fresh_prefill=False):
+        if (self.input_rms_fp8_backend == "triton"
+                and self.input_rms_fp8_execution(x, fresh_prefill=fresh_prefill)["selected_backend"] == "triton"):
+            from ._input_rms_fp8 import project
+
+            gdn = self.kind == "linear_attention"
+            projection = self.linear_attn.in_proj_qkvz if gdn else self.self_attn.qkv_proj
+            normalized, outputs = project(x, self.input_layernorm, projection, keep_bf16=gdn)
+            self.input_rms_fp8_calls["triton"] += 1
+            # FullAttention uses x only for shape when its projection outputs are supplied.
+            return normalized if gdn else x, outputs
         normalized = self.input_layernorm(x)
-        mixed = (
-            self.linear_attn(normalized, state)
-            if self.kind == "linear_attention"
-            else self.self_attn(normalized, state, positions, cos, sin,
-                                fresh_prefill=fresh_prefill)
-        )
+        self.input_rms_fp8_calls["native"] += 1
+        return normalized, None
+
+    def forward(self, x, state, positions, cos, sin, *, fresh_prefill=False):
+        normalized, projected = self._forward_input(x, fresh_prefill=fresh_prefill)
+        if projected is None:
+            mixed = (
+                self.linear_attn(normalized, state)
+                if self.kind == "linear_attention"
+                else self.self_attn(normalized, state, positions, cos, sin,
+                                    fresh_prefill=fresh_prefill)
+            )
+        else:
+            mixed = (
+                self.linear_attn(normalized, state, _input_projection=projected)
+                if self.kind == "linear_attention"
+                else self.self_attn(normalized, state, positions, cos, sin,
+                                    fresh_prefill=fresh_prefill, _input_projection=projected)
+            )
         # 残差相加与 post-attention norm 折成一个 kernel：x ← x + mixed（原地），
         # 同时产出归一化结果，少一次物化。数值语义与分开写相同。
         norm = self.post_attention_layernorm
