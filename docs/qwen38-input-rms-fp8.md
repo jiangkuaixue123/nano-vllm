@@ -48,6 +48,11 @@ norm/quant paths motivate the handoff but are not imported or runtime
 dependencies. No native build is added.
 
 Focused CPU controls cover routing, the private consumer, cache/capture
-preconditions and buffer ownership. GPU compilation, actual operands, same-arm
-Graph comparisons, cross-native diagnostics, full task quality and performance
-remain untested. This selector makes no speed or service claim.
+preconditions and buffer ownership. Actual-operand operator diagnostics and a
+short service comparison are recorded in the
+[campaign acceptance issue](https://github.com/InferMatrixLab/InferRSI/issues/67).
+They include same-arm Graph/state/reset checks and cross-native diagnostics;
+cross-native FP8 and projection results are not generally bit-exact. The short
+service comparison is one measured pair, not formal statistical or task-quality
+acceptance. The selector remains experimental and disabled by default while
+full campaign validation is outstanding.
