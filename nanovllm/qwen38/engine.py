@@ -180,13 +180,17 @@ class DedicatedEngine:
             modules = {name: module for name, module in self.runner.model.named_modules()
                        if isinstance(module, FP8Linear)}
             calls = {name: module.native_fp8_calls for name, module in modules.items()}
+            token8 = getattr(self.runner.model, "_fp8_token8_runtime", None)
+            kernel_names = ("flashinfer", "triton", "deepgemm") + (("token8",) if token8 is not None else ())
+            consumer = ("nanovllm.fp8_token8_prequantized" if token8 is not None
+                        else "flashinfer.fp8_blockscale_gemm_sm90_prequantized")
             execution = {"fp8_execution": {"modules": len(calls), "total_calls": sum(calls.values()),
                          "call_counter_scope": "python_forward_only_includes_warmup_and_capture_excludes_graph_replay",
                          "backend": self.loader_report["backend"],
                          "kernel_name": self.loader_report["kernel_name"],
                          "executed_modules": sum(count > 0 for count in calls.values()), "per_module_calls": calls,
-                         "kernel_calls": {kernel: sum(module.kernel_calls[kernel] for module in modules.values())
-                                          for kernel in ("flashinfer", "triton", "deepgemm")},
+                         "kernel_calls": {kernel: sum(module.kernel_calls.get(kernel, 0) for module in modules.values())
+                                          for kernel in kernel_names},
                          "deepgemm_quantization_calls": {
                              backend: sum(module.deepgemm_quantization_calls[backend] for module in modules.values())
                              for backend in ("native", "row4")},
@@ -194,6 +198,10 @@ class DedicatedEngine:
                          "actual_dtypes_valid": all(module.weight.dtype == torch.float8_e4m3fn
                                                     and module.weight_scale_inv.dtype == torch.float32
                                                     for module in modules.values())}}
+            if token8 is not None:
+                execution["fp8_token8_execution"] = token8.snapshot()
+                execution["fp8_token8_execution"]["scope"] = "single_token_continuation_prequantized_only"
+                execution["fp8_token8_execution"]["call_counter_scope"] = "python_calls_excludes_graph_replay"
             from .model import MLP, DecoderLayer, DeltaNet, FullAttention
 
             input_norms = {name: module for name, module in self.runner.model.named_modules()
@@ -206,7 +214,7 @@ class DedicatedEngine:
                                        for module in input_norms.values())
                           for backend in ("native", "triton")},
                 "candidate_kernel": "_input_rms_quant_kernel",
-                "consumer": "flashinfer.fp8_blockscale_gemm_sm90_prequantized",
+                "consumer": consumer,
             }
             mlps = {name: module for name, module in self.runner.model.named_modules()
                     if isinstance(module, MLP)}
@@ -216,7 +224,7 @@ class DedicatedEngine:
                 "calls": {backend: sum(module.postnorm_fp8_calls[backend] for module in mlps.values())
                           for backend in ("native", "triton")},
                 "candidate_kernel": "_add_rms_quant_kernel",
-                "consumer": "flashinfer.fp8_blockscale_gemm_sm90_prequantized",
+                "consumer": consumer,
             }
             execution["silu_fp8_execution"] = {
                 "call_counter_scope": "python_producer_down_calls_excludes_graph_replay",
@@ -224,7 +232,7 @@ class DedicatedEngine:
                 "calls": {backend: sum(module.silu_fp8_calls[backend] for module in mlps.values())
                           for backend in ("native", "triton")},
                 "candidate_kernel": "_silu_mul_quant_kernel",
-                "consumer": "flashinfer.fp8_blockscale_gemm_sm90_prequantized",
+                "consumer": consumer,
             }
             gdn = {name: module for name, module in self.runner.model.named_modules()
                    if isinstance(module, DeltaNet)}
@@ -234,7 +242,7 @@ class DedicatedEngine:
                 "calls": {backend: sum(module.outnorm_fp8_calls[backend] for module in gdn.values())
                           for backend in ("native", "triton")},
                 "candidate_kernel": "_outnorm_quant_kernel",
-                "consumer": "flashinfer.fp8_blockscale_gemm_sm90_prequantized",
+                "consumer": consumer,
             }
             attention = {name: module for name, module in self.runner.model.named_modules()
                          if isinstance(module, FullAttention)}

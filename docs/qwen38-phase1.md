@@ -333,3 +333,32 @@ outside default pytest discovery. It compares exact finite BF16 bits, signed
 zeros, nonfinite classes, unchanged tail bits, storage ownership and strided
 inputs. It can replay trusted task-owned captured postnorm operands. Operator
 success alone does not qualify full-model/Graph state, quality or service gains.
+
+## Optional token-axis N8 FP8 consumer
+
+`NANOVLLM_FP8_DECODE_CONSUMER=token8` selects a model-owned FP8 consumer for
+the prepared single-token input, MLP gate/up, MLP down and GDN output routes.
+The default is `native`. Selection is fixed when projections are constructed
+and survives projection merging. It requires merged FP8 projections, a
+FlashInfer small-M backend, and the existing input-RMS, postnorm, SwiGLU and GDN
+output FP8 producers set to `triton` (including `NANOVLLM_GDN_OUTNORM=triton`
+and `NANOVLLM_MLP_ACTIVATION=triton`).
+Prefill, fresh singleton prefill, multi-token calls and the ordinary BF16-input
+full-attention output projection retain their native consumers.
+
+The packaged CUDA implementation retains the original FP8 checkpoint codes,
+block scales and eight-stage accumulation order. It is restricted to the five
+declared geometries and the SM90 device with 78 SMs. Model loading eagerly builds
+an owned shared library with explicit SM90a cubin/PTX targets, validates each
+function's FP8 instruction shape and resources, and retains the library and
+temporary build directory for the model/Graph lifetime. A CUDA toolkit with
+`nvcc` and `cuobjdump` plus a host C++ compiler is required; `CUDA_HOME`, `CXX`
+and `XDG_CACHE_HOME` select their locations. No binary disk-cache entry is reused.
+Failure to prepare or execute the selected consumer raises without fallback.
+
+Every selected consumer must execute eagerly before capture. Admission checks
+all selected owners before model state writes; an older native warmup flag does
+not qualify the new consumer. Health provenance includes the selected consumer,
+binary/source/resource identity and successful Python host-call counts. Graph
+replays do not increment these counters. Compiler/operator evidence alone does
+not qualify integrated Graph state, model quality or service performance.

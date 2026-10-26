@@ -21,7 +21,7 @@ class FP8Linear(nn.Module):
     backend = "triton_block_fp8"
     kernel_name = "qwen38_block_fp8"
 
-    def __init__(self, in_features: int, out_features: int, *, device=None):
+    def __init__(self, in_features: int, out_features: int, *, device=None, decode_consumer=None):
         super().__init__()
         requested = os.environ.get("NANOVLLM_FP8_GEMM", "triton")
         if requested not in ("triton", self.backend, "flashinfer", "flashinfer_deepgemm"):
@@ -29,6 +29,11 @@ class FP8Linear(nn.Module):
                 f"Unsupported NANOVLLM_FP8_GEMM={requested!r}; this build implements "
                 "triton, flashinfer and flashinfer_deepgemm. No fallback was selected."
             )
+        selected = os.environ.get("NANOVLLM_FP8_DECODE_CONSUMER", "native") if decode_consumer is None else decode_consumer
+        if selected not in ("native", "token8"):
+            raise ValueError("Unsupported NANOVLLM_FP8_DECODE_CONSUMER")
+        self._fp8_decode_consumer = selected
+        self._token8_active = False
         self.use_flashinfer = requested in ("flashinfer", "flashinfer_deepgemm")
         self.use_deepgemm = requested == "flashinfer_deepgemm"
         self.deepgemm_quantization = os.environ.get("NANOVLLM_DEEPGEMM_QUANTIZATION", "native")
@@ -54,6 +59,12 @@ class FP8Linear(nn.Module):
         self.native_fp8_calls = 0
         self.kernel_calls = {"flashinfer": 0, "triton": 0, "deepgemm": 0}
         self.deepgemm_quantization_calls = {"native": 0, "row4": 0}
+        if self._fp8_decode_consumer == "token8":
+            self.kernel_calls["token8"] = 0
+
+    @property
+    def fp8_decode_consumer(self):
+        return self._fp8_decode_consumer
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         if inputs.ndim < 2 or inputs.shape[-1] != self.in_features or inputs.numel() == 0:
@@ -76,6 +87,12 @@ class FP8Linear(nn.Module):
         if reason:
             raise ValueError("SwiGLU FP8 projection: " + reason)
         with torch.cuda.device(device):
+            if getattr(self, "_fp8_decode_consumer", "native") == "token8":
+                from ._fp8_token8 import consumer_for
+
+                consumer = consumer_for(self, device, "silu")
+                if self._token8_active:
+                    return consumer
             if (torch.cuda.is_current_stream_capturing()
                     and getattr(self, "_silu_fp8_ready_device", None) != device):
                 raise RuntimeError("Warm the SwiGLU FP8 path eagerly before CUDA Graph capture")
@@ -91,7 +108,7 @@ class FP8Linear(nn.Module):
             gemm = self._prepare_silu_fp8(values.device)
             result = gemm(values, self.weight, input_scale=scales,
                           weight_scale=self.weight_scale_inv, out_dtype=torch.bfloat16)
-        self.kernel_calls["flashinfer"] += 1
+        self.kernel_calls["token8" if getattr(self, "_token8_active", False) else "flashinfer"] += 1
         self.native_fp8_calls += 1
         return result.reshape(*input_shape[:-1], self.out_features)
 
@@ -103,6 +120,12 @@ class FP8Linear(nn.Module):
         if reason:
             raise ValueError("GDN output FP8 projection: " + reason)
         with torch.cuda.device(device):
+            if getattr(self, "_fp8_decode_consumer", "native") == "token8":
+                from ._fp8_token8 import consumer_for
+
+                consumer = consumer_for(self, device, "gdn_outnorm")
+                if self._token8_active:
+                    return consumer
             if (torch.cuda.is_current_stream_capturing()
                     and getattr(self, "_gdn_outnorm_fp8_ready_device", None) != device):
                 raise RuntimeError("Warm the GDN output norm FP8 path eagerly before CUDA Graph capture")
@@ -118,7 +141,7 @@ class FP8Linear(nn.Module):
             gemm = self._prepare_gdn_outnorm_fp8(values.device)
             result = gemm(values, self.weight, input_scale=scales,
                           weight_scale=self.weight_scale_inv, out_dtype=torch.bfloat16)
-        self.kernel_calls["flashinfer"] += 1
+        self.kernel_calls["token8" if getattr(self, "_token8_active", False) else "flashinfer"] += 1
         self.native_fp8_calls += 1
         return result.reshape(*input_shape[:-1], self.out_features)
 
@@ -162,7 +185,7 @@ class FP8MergedLinear(FP8Linear):
     weights and scales load directly into slices of the single allocation.
     """
 
-    def __init__(self, in_features, out_sizes, names, *, device=None):
+    def __init__(self, in_features, out_sizes, names, *, device=None, decode_consumer=None):
         self.out_sizes = tuple(out_sizes)
         self.names = tuple(names)
         if (not self.out_sizes or len(self.out_sizes) != len(self.names)
@@ -170,7 +193,7 @@ class FP8MergedLinear(FP8Linear):
                 or in_features % 128
                 or any(size <= 0 or size % 128 for size in self.out_sizes)):
             raise ValueError("Merged FP8 projections require distinct names and 128-aligned blocks")
-        super().__init__(in_features, sum(self.out_sizes), device=device)
+        super().__init__(in_features, sum(self.out_sizes), device=device, decode_consumer=decode_consumer)
 
     def _prepare_postnorm_fp8(self, device):
         """Import the public entry; a complete eager call must precede capture."""
@@ -180,6 +203,12 @@ class FP8MergedLinear(FP8Linear):
         if reason:
             raise ValueError("Post-attention FP8 projection: " + reason)
         with torch.cuda.device(device):
+            if getattr(self, "_fp8_decode_consumer", "native") == "token8":
+                from ._fp8_token8 import consumer_for
+
+                consumer = consumer_for(self, device, "postnorm")
+                if self._token8_active:
+                    return consumer
             if (torch.cuda.is_current_stream_capturing()
                     and getattr(self, "_postnorm_fp8_ready_device", None) != device):
                 raise RuntimeError("Warm the post-attention FP8 path eagerly before CUDA Graph capture")
@@ -196,7 +225,7 @@ class FP8MergedLinear(FP8Linear):
             gemm = self._prepare_postnorm_fp8(values.device)
             result = gemm(values, self.weight, input_scale=scales,
                           weight_scale=self.weight_scale_inv, out_dtype=torch.bfloat16)
-        self.kernel_calls["flashinfer"] += 1
+        self.kernel_calls["token8" if getattr(self, "_token8_active", False) else "flashinfer"] += 1
         self.native_fp8_calls += 1
         return result.reshape(*input_shape[:-1], self.out_features).split(self.out_sizes, dim=-1)
 
@@ -207,6 +236,12 @@ class FP8MergedLinear(FP8Linear):
         if reason:
             raise ValueError("Input RMS/FP8 projection: " + reason)
         with torch.cuda.device(device):
+            if getattr(self, "_fp8_decode_consumer", "native") == "token8":
+                from ._fp8_token8 import consumer_for
+
+                consumer = consumer_for(self, device, "input_rms")
+                if self._token8_active:
+                    return consumer
             if (torch.cuda.is_current_stream_capturing()
                     and getattr(self, "_input_rms_fp8_ready_device", None) != device):
                 raise RuntimeError("Warm the complete input RMS/FP8 pair before capture")
@@ -223,7 +258,7 @@ class FP8MergedLinear(FP8Linear):
             gemm = self._prepare_input_rms_fp8(values.device, keep_bf16)
             result = gemm(values, self.weight, input_scale=scales,
                           weight_scale=self.weight_scale_inv, out_dtype=torch.bfloat16)
-        self.kernel_calls["flashinfer"] += 1
+        self.kernel_calls["token8" if getattr(self, "_token8_active", False) else "flashinfer"] += 1
         self.native_fp8_calls += 1
         return result.reshape(*input_shape[:-1], self.out_features).split(self.out_sizes, dim=-1)
 
@@ -258,11 +293,13 @@ def fuse_fp8_projections(model):
                 or not all(part.weight.is_meta and part.weight_scale_inv.is_meta for part in parts)
                 or len({part.in_features for part in parts}) != 1
                 or len({part.deepgemm_quantization for part in parts}) != 1
-                or len({part.backend for part in parts}) != 1):
+                or len({part.backend for part in parts}) != 1
+                or len({part.fp8_decode_consumer for part in parts}) != 1):
             raise ValueError("FP8 projection fusion requires unallocated compatible FP8 linears")
         first = parts[0]
         merged = FP8MergedLinear(
             first.in_features, [part.out_features for part in parts], names, device="meta",
+            decode_consumer=first.fp8_decode_consumer,
         )
         # Backend selection belongs to the original constructed modules.
         for attribute in ("use_flashinfer", "use_deepgemm", "backend", "kernel_name", "deepgemm_quantization"):

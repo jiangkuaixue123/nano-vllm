@@ -1,0 +1,16 @@
+{
+  "LICENSE-Apache-2.0.txt": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+  "LICENSE-DeepSeek-MIT.txt": "6c73a30c14a2938abaa6afe98ebb19e6d81dac5bd4ace0cb05c61c20afa37b85",
+  "LICENSE-Original-Binding-MIT.txt": "97648cbc67d6ed6a68ebc6a31b06c0741ff73a2abb13cc18abffd81f26cd5dd4",
+  "NOTICE-token8.txt": "157ebcc95fb96ade272c7bd2d3f0b2f626b9508fb5ffce344152a8e6e33ccd11",
+  "NOTICE.txt": "3d0413b376ca34a64509199cf3ff0c2f174e8fc2e842b4685f5b3930adc7a6d6",
+  "launch.cu": "22f0e38623f152186fb5e1c683b3263183f2569e6c030647f6b0572f86e0d783",
+  "provenance.json": "4cd9bae9fee6f5590937585ab07cb4862b152ed5ad385f3d8ca8eaac76c628a0",
+  "token8_mma.cuh": "d7cf8f432bd74656010badf853be589ade47d22c6aad37c4d561ed1bb414df0f",
+  "vendor/fp8_gemm_impl.cuh": "ef50513aa97f71be559a9a8191977f2b254768a74e46de1edbb9717b79dd54dc",
+  "vendor/mma_utils.cuh": "b56db5a8c03a283c5a26119bf898a9b79b203e06229656bafa6dbfae9a84bb83",
+  "vendor/nvrtc_cutlass.cuh": "b15184b992aee69dea85ed82e04831f674145519afc4b645a56e55e1c3a0ad77",
+  "vendor/scheduler.cuh": "dbe76fea0106b1147645862837b8d3ad85349e2a742affabdf32bb9fba436a47",
+  "vendor/tma_utils.cuh": "0ae8184fc2ffff63c3803693d12f97ade61cae8f56f142a853c2cf1f955c5935",
+  "vendor/utils.cuh": "615428aa83e007841a9214ba7e20d091a2402aaebacd47d8122eb1f60e054a7b"
+}

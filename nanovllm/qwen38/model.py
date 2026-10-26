@@ -868,6 +868,9 @@ class Qwen38ForCausalLM(nn.Module):
         end = state.length + input_ids.shape[1]
         if state.positions is None and end > self.config.max_position_embeddings:
             raise ValueError("Context exceeds model position limit")
+        token8 = getattr(self, "_fp8_token8_runtime", None)
+        if token8 is not None:
+            token8.begin_forward(self, state, input_ids)
         # Stage updates transactionally; functions never mutate old tensor storage.
         pending = [
             LayerState(capacity=layer.capacity, key=layer.key, value=layer.value,

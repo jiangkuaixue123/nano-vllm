@@ -1,0 +1,1 @@
+N8 helper is a four-accumulator derivative of the retained NVIDIA/DeepSeek FP8 MMA helper. Original copyright and MIT/Apache-2.0 notices are retained. The original six vendor headers are unchanged. launch.cu is a derivative of the original isolated MIT probe binding. No installed runtime is modified.

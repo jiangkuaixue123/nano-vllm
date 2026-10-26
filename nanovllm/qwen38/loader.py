@@ -297,6 +297,11 @@ def load_checkpoint(model_path: str | Path, *, device: str = "cuda:0"):
         raise ValueError("Unsupported NANOVLLM_FP8_PROJECTIONS")
     if projection_layout == "merged" and config.weight_format != "fp8":
         raise ValueError("Merged FP8 projections require an FP8 checkpoint")
+    decode_consumer = os.environ.get("NANOVLLM_FP8_DECODE_CONSUMER", "native")
+    if decode_consumer not in ("native", "token8"):
+        raise ValueError("Unsupported NANOVLLM_FP8_DECODE_CONSUMER")
+    if decode_consumer == "token8" and (config.weight_format != "fp8" or projection_layout != "merged"):
+        raise ValueError("Token8 requires the original FP8 checkpoint and merged projections")
     ba_layout = os.environ.get("NANOVLLM_GDN_BA_PROJECTIONS", "separate")
     if ba_layout not in ("separate", "merged"):
         raise ValueError("Unsupported NANOVLLM_GDN_BA_PROJECTIONS")
@@ -325,4 +330,10 @@ def load_checkpoint(model_path: str | Path, *, device: str = "cuda:0"):
     model.to_empty(device=device)
     report = load_weights(model, root)
     model.eval()
+    if decode_consumer == "token8":
+        from ._fp8_token8 import prepare_model
+
+        report["fp8_decode_consumer"] = prepare_model(model)
+        report["backend"] = "token8_prequantized+" + report["backend"]
+        report["kernel_name"] = "fp8_token8_prequantized+" + report["kernel_name"]
     return model, report
