@@ -362,3 +362,31 @@ not qualify the new consumer. Health provenance includes the selected consumer,
 binary/source/resource identity and successful Python host-call counts. Graph
 replays do not increment these counters. Compiler/operator evidence alone does
 not qualify integrated Graph state, model quality or service performance.
+
+
+`NANOVLLM_FP8_TOKEN8_POLICY=pool80` additionally selects the fixed four-stage,
+40/80-register-request, grid156 N8 policy for the 64 MLP gate/up, 48 GDN input
+and 16 full-attention input owners. It requires `NANOVLLM_FP8_DECODE_CONSUMER=token8`.
+The default policy is `original`; invalid or incompatible selections raise.
+The loader captures this policy once before constructing the model. It retains
+the original N8 consumer for the other 112 prepared owners and the native
+consumer for the 16 full-attention output projections. N8 describes the MMA
+output tile; neither policy performs speculative decoding.
+
+The opt-in policy builds a second model-owned library from the retained exact
+six-function source. The two libraries share the unchanged packaged vendor
+headers; the original launch source is unchanged. The pool80 library retains
+original N8 controls and admits the exact initial register allocations, emitted
+register reconfiguration, FP8 instructions, output stores and resource bounds.
+These checks do not establish actual two-CTA residency. Successful preparation
+records both binary identities and resources, the selected policy per geometry,
+and the number of pool80 owners. Existing per-case host-call counters include
+calls to the selected policy; Graph replays do not increment them.
+
+The original FP8 checkpoint bytes/scales, activation quantizers, state precision,
+output ABI, native prefill and eager-before-capture requirement are preserved.
+Preparation or selected-kernel failure raises without retry or fallback. There
+is no user-supplied prebuilt-library path or automatic cache reuse. Operator
+qualification of retained source does not qualify a newly compiled binary or
+this model integration; full-model quality, Graph safety and service performance
+remain unverified until separately validated under the governing acceptance issue.

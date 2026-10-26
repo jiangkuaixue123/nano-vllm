@@ -65,5 +65,22 @@
     ],
     "installed_runtime_modified": false,
     "original_vendor_bytes_preserved": true
+  },
+  "pool80_derivative": {
+    "scope": "Optional fixed K5120/N34816, N16384 and N14336 full N8 consumer: eight-stage/40-232/grid78 controls and four-stage/40-80/grid156 candidates",
+    "kernel_change": "Relative to the original full swapAB kernel, only the function name and math-register request (232 to 80) differ; unchanged arithmetic, layout, barriers and scheduler",
+    "packaged_files": {
+      "pool80_launch.cu": {
+        "sha256": "643d51c32b926060a6b5aff9b8f54aed771b00bd68f2a66ed4cf6e3fb0a539a4",
+        "bytes": 8397
+      },
+      "coupled_kernel.cuh": {
+        "sha256": "a9bff4db7501b6602d136fc934ec8dfe15fea7912cf4e8c3ec085bcaa3a9d9e4",
+        "bytes": 18598
+      }
+    },
+    "launch_origin": "Exact isolated six-function binding; file renamed from launch.cu without changing its bytes",
+    "original_vendor_bytes_preserved": true,
+    "validation_scope": "Integrated runtime, model quality and service performance require separate acceptance evidence; no occupancy claim"
   }
 }

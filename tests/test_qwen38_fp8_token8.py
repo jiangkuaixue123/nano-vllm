@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import runpy
+import sys
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -40,7 +41,8 @@ def setup(case="gate_up"):
            weight=tensor((n, k), "fp8", device),
            weight_scale_inv=tensor((n // 128, k // 128), "f32", device), kernel_calls={"token8": 0})
     calls = []
-    binary = NS(device=0, identity=dict(source_sha256="source", binary_sha256="binary", resource_admitted=True),
+    binary = NS(device=0, policy="original", cases=tuple(BUILD["CASES"]), launch_name="token_n8_launch",
+                identity=dict(source_sha256="source", binary_sha256="binary", resource_admitted=True, policy="original"),
                 call=lambda *args: calls.append(args), resource_rows={}, compiled_resources={}, resource_accounting={})
     p._token8_binding = TOKEN["Consumer"](torch, p, case, binary)
     q = tensor((1, k), "fp8", device)
@@ -231,7 +233,8 @@ def test_actual_reporting_includes_successful_token8_calls():
             assert result[name + "_fp8_execution"]["consumer"] == ("nanovllm.fp8_token8_prequantized" if selected else "flashinfer.fp8_blockscale_gemm_sm90_prequantized")
 
 
-def test_eager_build_owns_sources_and_rejects_dependency_drift(tmp_path, monkeypatch):
+@pytest.mark.parametrize('policy', ['original', 'pool80'])
+def test_eager_build_owns_sources_and_rejects_dependency_drift(tmp_path, monkeypatch, policy):
     """Run the actual builder with filesystem fixtures and a compiler double."""
     globals_ = BUILD["build"].__globals__
     cuda = tmp_path / "cuda"
@@ -245,6 +248,7 @@ def test_eager_build_owns_sources_and_rejects_dependency_drift(tmp_path, monkeyp
     source = tmp_path / "packaged"
     source.mkdir()
     (source / "launch.cu").write_text("source")
+    (source / "pool80_launch.cu").write_text("pool80 source")
     header = tmp_path / "header.h"
     header.write_text("dependency")
     monkeypatch.setenv("CUDA_HOME", str(cuda))
@@ -259,6 +263,7 @@ def test_eager_build_owns_sources_and_rejects_dependency_drift(tmp_path, monkeyp
 
     def compiler(command, **kwargs):
         commands.append(command)
+        assert Path(command[1]).name == ('pool80_launch.cu' if policy == 'pool80' else 'launch.cu')
         output = Path(command[command.index("-o") + 1])
         assert Path(kwargs["env"]["TMPDIR"]) == kwargs["cwd"] == output.parent
         assert "--gpu-architecture=compute_90a" in command and "--gpu-code=sm_90a,compute_90a" in command
@@ -272,18 +277,132 @@ def test_eager_build_owns_sources_and_rejects_dependency_drift(tmp_path, monkeyp
         return NS(stdout=b"", stderr=b"")
 
     monkeypatch.setattr(globals_["subprocess"], "run", compiler)
-    work, library, _, identity = BUILD["build"]()
+    work, library, _, identity = BUILD["build"](policy=policy)
     try:
         assert library.is_file() and len(commands) == 2
         assert identity["disk_cache_reused"] is False and identity["dependency_count"] == 1
         assert identity["binary_sha256"] == hashlib.sha256(b"mock binary").hexdigest()
+        assert identity['policy'] == policy
     finally:
         work.cleanup()
     drift = True
     with pytest.raises(RuntimeError, match="dependency drift"):
-        BUILD["build"]()
+        BUILD["build"](policy=policy)
     assert list((tmp_path / "cache/nanovllm/fp8_token8").iterdir()) == []
     monkeypatch.setenv("NVCC_APPEND_FLAGS", "--gpu-architecture=compute_90")
     with pytest.raises(RuntimeError, match="ambient compiler"):
-        BUILD["build"]()
+        BUILD["build"](policy=policy)
     assert len(commands) == 4
+
+
+@pytest.mark.parametrize('policy', ['original', 'pool80'])
+def test_prepare_routes_exact_owners_and_keeps_both_graph_lifetimes(monkeypatch, policy):
+    """Execute production preparation for the complete owner inventory on CPU."""
+    torch, first, _, _, _, _ = setup()
+    monkeypatch.setitem(sys.modules, 'torch', torch)
+    class Projection(NS):
+        pass
+    owners = []
+    for index in range(64):
+        cases = [('mlp.gate_up_proj', 'gate_up'), ('mlp.down_proj', 'down')]
+        cases += ([('self_attn.qkv_proj', 'fa_input'), ('self_attn.o_proj', 'gdn_output')]
+                  if index % 4 == 3 else
+                  [('linear_attn.in_proj_qkvz', 'gdn_input'), ('linear_attn.out_proj', 'gdn_output')])
+        for suffix, case in cases:
+            _, p, _, _, _, _ = setup(case)
+            p = Projection(**vars(p))
+            del p._token8_binding
+            p._token8_active = False
+            p.weight.device = p.weight_scale_inv.device = first.weight.device
+            owners.append((f'model.layers.{index}.{suffix}', p))
+    m = model()
+    m.named_modules = lambda: iter(owners)
+    binaries, calls = [], []
+    def binary_factory(torch, *, policy='original'):
+        binary = NS(device=0, policy=policy,
+            cases=BUILD['POOL80_CASES'] if policy == 'pool80' else tuple(BUILD['CASES']),
+            launch_name='coupled_n8_launch' if policy == 'pool80' else 'token_n8_launch',
+            identity=dict(source_sha256='source', binary_sha256=policy, resource_admitted=True, policy=policy),
+            call=lambda *args: calls.append(args), resource_rows={}, compiled_resources={}, resource_accounting={})
+        binaries.append(binary)
+        return binary
+    ns = execute([function('_fp8_token8.py', 'prepare_model')],
+                 dict(TOKEN, Binary=binary_factory, FP8Linear=Projection))
+    report = ns['prepare_model'](m, policy=policy)
+    runtime = m._fp8_token8_runtime
+    assert len(runtime.owners) == 240 and len(binaries) == (2 if policy == 'pool80' else 1)
+    assert report['policy'] == policy and report['ready_owners'] == 0
+    assert (report['pool80']['owners'] if policy == 'pool80' else report['pool80']) == (128 if policy == 'pool80' else None)
+    expected = {'gate_up': 64, 'gdn_input': 48, 'fa_input': 16}
+    selected = {case: 0 for case in expected}
+    for name, p in runtime.owners:
+        binding = p._token8_binding
+        uses_pool = policy == 'pool80' and binding.case in expected
+        assert binding.binary is binaries[-1 if uses_pool else 0]
+        assert report['case_policies'][binding.case] == ('pool80' if uses_pool else 'original')
+        if uses_pool:
+            selected[binding.case] += 1
+        p._token8_active = True
+        k = p.in_features
+        q = tensor((1, k), 'fp8', p.weight.device)
+        scales = tensor((1, k // 128), 'f32', p.weight.device, strides=(1, 4), capacity=k // 128 * 16)
+        binding(q, p.weight, input_scale=scales, weight_scale=p.weight_scale_inv, out_dtype='bf16')
+        assert calls[-1][:3] == (binding.binary.launch_name, BUILD['CASES'][binding.case]['id'], 1)
+    assert selected == (expected if policy == 'pool80' else {case: 0 for case in expected})
+    assert sum(args[0] == 'coupled_n8_launch' for args in calls) == (128 if policy == 'pool80' else 0)
+    assert all(not p._token8_active for name, p in owners if name.endswith('self_attn.o_proj'))
+    # Native owners are never rebound or included in the runtime, even at the GDN output geometry.
+    assert all(not hasattr(p, '_token8_binding') for name, p in owners if name.endswith('self_attn.o_proj'))
+    torch.cuda.is_current_stream_capturing = lambda: True
+    ids = NS(shape=(1, 1), device=first.weight.device)
+    runtime.begin_forward(m, NS(length=8192, positions=None), ids)
+    assert runtime.snapshot()['ready_owners'] == 240
+    for _, p in runtime.owners:
+        p._token8_active = False
+    binaries[-1].identity['policy'] = 'changed'
+    with pytest.raises(RuntimeError, match='identity'):
+        runtime.begin_forward(m, NS(length=8192, positions=None), ids)
+    assert not any(p._token8_active for _, p in runtime.owners)
+
+
+def test_pool80_selection_is_explicit_and_resource_failures_stop(monkeypatch):
+    monkeypatch.delenv('NANOVLLM_FP8_TOKEN8_POLICY', raising=False)
+    assert BUILD['selected_policy']() == 'original'
+    monkeypatch.setenv('NANOVLLM_FP8_TOKEN8_POLICY', 'pool80')
+    assert BUILD['selected_policy']() == 'pool80'
+    monkeypatch.setenv('NANOVLLM_FP8_TOKEN8_POLICY', 'auto')
+    with pytest.raises(RuntimeError, match='Unsupported'):
+        BUILD['selected_policy']()
+    rows = {}
+    for label in BUILD['POOL80_SYMBOLS']:
+        selected = label.endswith(':pool80')
+        rows[label] = dict(requested_dynamic_bytes=72416 if selected else 142624,
+            sms=78, binary_version=90, registers=80 if selected else 168,
+            static_shared_bytes=0, device_registers_per_block=65536,
+            device_optin_shared_bytes=232448, local_bytes=0, max_threads=384)
+    BUILD['check_resources'](rows, policy='pool80')
+    for key, bad in [('registers', 96), ('local_bytes', 4), ('requested_dynamic_bytes', 142624)]:
+        changed = copy.deepcopy(rows)
+        changed['gate_up:pool80'][key] = bad
+        with pytest.raises(RuntimeError):
+            BUILD['check_resources'](changed, policy='pool80')
+    with pytest.raises(RuntimeError):
+        BUILD['check_resources'](rows)
+    with pytest.raises(RuntimeError):
+        BUILD['check_resources'](dict(rows, **{'down:pool80': rows['gate_up:pool80']}), policy='pool80')
+
+
+def test_packaged_pool80_derivatives_keep_the_qualified_content():
+    source = BUILD['SOURCE']
+    provenance = json.loads((source / 'provenance.json').read_text())
+    for name, record in provenance['pool80_derivative']['packaged_files'].items():
+        data = (source / name).read_bytes()
+        assert len(data) == record['bytes'] and hashlib.sha256(data).hexdigest() == record['sha256']
+    # Compare the whole original kernel body, not an arithmetic reimplementation.
+    original = (source / 'vendor/fp8_gemm_impl.cuh').read_text()
+    start = original.index('template <uint32_t SHAPE_M', original.index('fp8_gemm_kernel_swapAB') - 800)
+    kernel = original[start:original.index('\n}  // namespace deep_gemm', start)]
+    coupled = (source / 'coupled_kernel.cuh').read_text()
+    body = coupled[coupled.index('template <uint32_t SHAPE_M'):coupled.index('\n}  // namespace deep_gemm')]
+    assert body == kernel.replace('fp8_gemm_kernel_swapAB(', 'fp8_gemm_kernel_swapAB_coupled(').replace(
+        'kNumMathRegisters = 232', 'kNumMathRegisters = 80')

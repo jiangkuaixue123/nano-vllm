@@ -48,6 +48,25 @@ def kernel_symbol(case, token_tile):
             'NS_26NormalSchedulerInputSwapABEEEvP13__nv_bfloat16PfT10_14CUtensorMap_stS8_S8_S8_')
 KERNEL_SYMBOLS = {case+':'+arm:kernel_symbol(case,width) for case in CASES
                   for arm,width in (('control128',16),('token8',8))}
+POOL80_CASES = ('gate_up', 'gdn_input', 'fa_input')
+POOL80_SYMBOLS = {
+    case+':'+arm: kernel_symbol(case, 8).replace(
+        '22fp8_gemm_kernel_swapAB', '30fp8_gemm_kernel_swapAB_coupled').replace(
+        'ELj8ELj128ELj128ELj1E', 'ELj4ELj128ELj128ELj1E')
+    if arm == 'pool80' else kernel_symbol(case, 8)
+    for case in POOL80_CASES for arm in ('control', 'pool80')
+}
+
+
+def selected_policy():
+    policy = os.environ.get('NANOVLLM_FP8_TOKEN8_POLICY', 'original')
+    require(policy in ('original', 'pool80'), 'Unsupported NANOVLLM_FP8_TOKEN8_POLICY')
+    return policy
+
+
+def policy_symbols(policy):
+    require(policy in ('original', 'pool80'), 'FP8 token8 fixed kernel policy')
+    return POOL80_SYMBOLS if policy == 'pool80' else KERNEL_SYMBOLS
 
 
 def require(value, reason):
@@ -55,27 +74,32 @@ def require(value, reason):
         raise RuntimeError(reason)
 
 
-def check_resources(rows):
-    require(set(rows) == set(KERNEL_SYMBOLS), 'ten fixed compiled resource records')
+def check_resources(rows, *, policy='original'):
+    require(set(rows) == set(policy_symbols(policy)), 'fixed compiled resource records')
     for name, row in rows.items():
         case,arm=name.split(':')
-        require(row['requested_dynamic_bytes'] == dynamic_bytes(case,8 if arm=='token8' else 16)
+        requested = (72416 if arm == 'pool80' else 142624) if policy == 'pool80' else dynamic_bytes(case,8 if arm=='token8' else 16)
+        require(row['requested_dynamic_bytes'] == requested
                 and row['sms'] == 78 and row['binary_version'] == 90
                 and row['registers'] > 0 and row['registers'] * 384 <= row['device_registers_per_block']
                 and row['static_shared_bytes'] + row['requested_dynamic_bytes'] <= row['device_optin_shared_bytes']
                 and row['local_bytes'] == 0 and row['max_threads'] >= 384,
                 'actual static/dynamic/register/local resource admission')
+        if policy == 'pool80':
+            require(row['registers'] == (80 if arm == 'pool80' else 168),
+                    'pool80 fixed compiled initial register allocation')
 
 
-def check_compiled_resources(rows, compiled):
+def check_compiled_resources(rows, compiled, *, policy='original'):
     """Keep API and binary quantities distinct; conservatively charge both."""
-    check_resources(rows)
-    require(set(compiled) == set(KERNEL_SYMBOLS), 'ten named compiled resource records')
+    check_resources(rows, policy=policy)
+    symbols = policy_symbols(policy)
+    require(set(compiled) == set(symbols), 'named compiled resource records')
     accounting = {}
     for label, row in rows.items():
         raw = compiled[label]
         require(set(raw) == {'symbol', 'registers', 'shared_bytes', 'stack_bytes', 'local_bytes'}
-                and raw['symbol'] == KERNEL_SYMBOLS[label]
+                and raw['symbol'] == symbols[label]
                 and all(type(raw[k]) is int and raw[k] >= 0
                         for k in ('registers', 'shared_bytes', 'stack_bytes', 'local_bytes'))
                 and type(row['static_shared_bytes']) is int and row['static_shared_bytes'] >= 0
@@ -93,31 +117,32 @@ def check_compiled_resources(rows, compiled):
     return accounting
 
 
-def compiled_evidence(rows, resource_text, ptx, sass):
-    """Parse retained evidence for the ten exact functions; no CUDA execution."""
+def compiled_evidence(rows, resource_text, ptx, sass, *, policy='original'):
+    """Parse retained evidence for one fixed function set; no CUDA execution."""
+    symbols = policy_symbols(policy)
     functions = re.findall(r' Function ([^\n]+):\n\s*(REG:[^\n]+)', resource_text)
-    require(len(functions) == 10 and {name for name, _ in functions} == set(KERNEL_SYMBOLS.values()),
-            'exact ten fixed compiled resource symbols')
+    require(len(functions) == len(symbols) and {name for name, _ in functions} == set(symbols.values()),
+            'exact fixed compiled resource symbols')
     compiled = {}
     for name, text in functions:
-        label = next(k for k, v in KERNEL_SYMBOLS.items() if v == name)
+        label = next(k for k, v in symbols.items() if v == name)
         pairs = re.findall(r'(REG|STACK|SHARED|LOCAL):(\d+)', text)
         values = {key: int(value) for key, value in pairs}
         require(len(pairs) == 4 and set(values) == {'REG', 'STACK', 'SHARED', 'LOCAL'},
                 'complete unique compiled resource fields')
         compiled[label] = dict(symbol=name, registers=values['REG'], shared_bytes=values['SHARED'],
                                stack_bytes=values['STACK'], local_bytes=values['LOCAL'])
-    accounting = check_compiled_resources(rows, compiled)
+    accounting = check_compiled_resources(rows, compiled, policy=policy)
     ptx_parts = re.split(r'(?m)^\.visible \.entry ([^\s(]+)\(', ptx)
     sass_parts = re.split(r'(?m)^\s*Function : (\S+)\s*$', sass)
-    require(len(ptx_parts) == len(sass_parts) == 21
-            and set(ptx_parts[1::2]) == set(sass_parts[1::2]) == set(KERNEL_SYMBOLS.values())
+    require(len(ptx_parts) == len(sass_parts) == 2 * len(symbols) + 1
+            and set(ptx_parts[1::2]) == set(sass_parts[1::2]) == set(symbols.values())
             and re.findall(r'(?m)^\.target (\S+)', ptx) == ['sm_90a'],
             'same exact PTX/SASS functions and architecture-specific PTX')
     ptx_bodies = dict(zip(ptx_parts[1::2], ptx_parts[2::2]))
     sass_bodies = dict(zip(sass_parts[1::2], sass_parts[2::2]))
-    for label, symbol in KERNEL_SYMBOLS.items():
-        width = 8 if label.endswith(':token8') else 16
+    for label, symbol in symbols.items():
+        width = 8 if policy == 'pool80' or label.endswith(':token8') else 16
         ptx_ops = re.findall(r'\bwgmma\.mma_async\.[A-Za-z0-9_.]+', ptx_bodies[symbol])
         sass_ops = re.findall(r'\b(?:[A-Z]*GMMA|WGMMA)(?:\.[A-Za-z0-9_]+)+', sass_bodies[symbol])
         require(ptx_ops and set(ptx_ops) == {f'wgmma.mma_async.sync.aligned.m64n{width}k32.f32.e4m3.e4m3'}
@@ -125,9 +150,18 @@ def compiled_evidence(rows, resource_text, ptx, sass):
                 and not re.search(r'\b(?:LDL|STL)(?:\.|\b)', sass_bodies[symbol]),
                 'each bound function has selected FP8 E4M3 WGMMA shape and no local spill instructions')
         stores = re.findall(r'\bstmatrix\.sync\.[A-Za-z0-9_.]+', ptx_bodies[symbol])
-        vector = 2 if label.endswith(':token8') else 4
+        vector = 2 if width == 8 else 4
         require(stores and set(stores) == {f'stmatrix.sync.aligned.x{vector}.m8n8.shared.b16.trans'},
                 'selected full-kernel transposed shared output store')
+        if policy == 'pool80':
+            math_registers = 80 if label.endswith(':pool80') else 232
+            reconfig = re.findall(r'setmaxnreg\.(dec|inc)\.sync\.aligned\.u32 (\d+);', ptx_bodies[symbol])
+            sass_reconfig = re.findall(r'USETMAXREG\.(DEALLOC|TRY_ALLOC)\.CTAPOOL (?:UP0, )?(0x[0-9a-f]+)', sass_bodies[symbol])
+            require(sorted(reconfig) == [('dec', '40'), ('inc', str(math_registers))]
+                    and sorted((op, int(n, 16)) for op, n in sass_reconfig) ==
+                    [('DEALLOC', 40), ('TRY_ALLOC', math_registers)]
+                    and compiled[label]['registers'] * 384 >= 40 * 128 + math_registers * 256,
+                    'fixed pool80 register directions and CTA-private register capacity')
     return compiled, accounting
 
 
@@ -149,12 +183,13 @@ def source_identity():
     return hashlib.sha256(json.dumps(actual,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 
 
-def build():
+def build(*, policy='original'):
     """One eager build per model; owned files stay alive with its library handle.
 
     No installed source lookup, native-library prerequisite, cache reuse or
     diagnostic log dependency. The enclosing process owns compilation lifetime.
     """
+    policy_symbols(policy)
     for name in ('NVCC_PREPEND_FLAGS','NVCC_APPEND_FLAGS','CPATH','CPLUS_INCLUDE_PATH','LIBRARY_PATH'):
         require(not os.environ.get(name),'FP8 token8 rejects ambient compiler injection: '+name)
     source_key=source_identity()
@@ -173,7 +208,8 @@ def build():
             {str(p.relative_to(SOURCE)):file_hash(p) for p in SOURCE.rglob('*') if p.is_file()} ==
             {str(p.relative_to(copied)):file_hash(p) for p in copied.rglob('*') if p.is_file()},
             'FP8 token8 source changed during preparation')
-    command=[str(cuda/'bin/nvcc'),str(copied/'launch.cu'),*DEVICE_FLAGS,'--compiler-bindir',host]
+    entry = 'pool80_launch.cu' if policy == 'pool80' else 'launch.cu'
+    command=[str(cuda/'bin/nvcc'),str(copied/entry),*DEVICE_FLAGS,'--compiler-bindir',host]
     dep=root/'dependencies.make';library=root/'kernel.so'
     environment={**os.environ,'TMPDIR':str(root)}
     try:
@@ -190,7 +226,7 @@ def build():
         return work,library,cuda/'bin/cuobjdump',dict(source_sha256=source_key,binary_sha256=file_hash(library),
             tool_sha256={Path(p).name:h for p,h in tool_ids.items()},dependency_count=len(dependencies),
             dependency_sha256=hashlib.sha256(json.dumps(dependencies,sort_keys=True).encode()).hexdigest(),
-            disk_cache_reused=False)
+            disk_cache_reused=False,policy=policy)
     except BaseException:
         work.cleanup()
         raise
@@ -198,22 +234,29 @@ def build():
 
 class Binary:
     """Pin both CDLL and its owned source/binary directory for graph lifetime."""
-    def __init__(self,torch):
+    def __init__(self,torch,*,policy='original'):
+        policy_symbols(policy)
+        self.policy=policy
+        self.cases=POOL80_CASES if policy == 'pool80' else tuple(CASES)
+        self.arms=('control', 'pool80') if policy == 'pool80' else ('control128', 'token8')
+        self.api='coupled_n8' if policy == 'pool80' else 'token_n8'
+        self.launch_name=self.api+'_launch'
         self.device=torch.cuda.current_device()
-        self.work,self.path,tool,self.identity=build()
+        self.work,self.path,tool,self.identity=build(policy=policy)
+        require(self.identity['policy']==policy, 'FP8 token8 build policy identity')
         self.library=ctypes.CDLL(str(self.path))
         require(file_hash(self.path)==self.identity['binary_sha256'],'FP8 token8 loaded binary drift')
-        self.library.token_n8_resources.argtypes=[ctypes.c_int,ctypes.c_int,ctypes.POINTER(ctypes.c_ulonglong),ctypes.c_char_p,ctypes.c_size_t]
-        self.library.token_n8_prepare.argtypes=[ctypes.c_char_p,ctypes.c_size_t]
-        self.library.token_n8_launch.argtypes=[ctypes.c_int,ctypes.c_int]+[ctypes.c_void_p]*6+[ctypes.c_char_p,ctypes.c_size_t]
-        for name in ('token_n8_resources','token_n8_prepare','token_n8_launch'):getattr(self.library,name).restype=ctypes.c_int
-        before=self.resources();check_resources(before);self.call('token_n8_prepare')
-        self.resource_rows=self.resources();check_resources(self.resource_rows)
+        getattr(self.library,self.api+'_resources').argtypes=[ctypes.c_int,ctypes.c_int,ctypes.POINTER(ctypes.c_ulonglong),ctypes.c_char_p,ctypes.c_size_t]
+        getattr(self.library,self.api+'_prepare').argtypes=[ctypes.c_char_p,ctypes.c_size_t]
+        getattr(self.library,self.launch_name).argtypes=[ctypes.c_int,ctypes.c_int]+[ctypes.c_void_p]*6+[ctypes.c_char_p,ctypes.c_size_t]
+        for suffix in ('_resources','_prepare','_launch'):getattr(self.library,self.api+suffix).restype=ctypes.c_int
+        before=self.resources();check_resources(before,policy=policy);self.call(self.api+'_prepare')
+        self.resource_rows=self.resources();check_resources(self.resource_rows,policy=policy)
         texts=[]
         for flag in ('--dump-resource-usage','--dump-ptx','--dump-sass'):
             result=subprocess.run([str(tool),flag,str(self.path)],check=True,capture_output=True,text=True,timeout=30)
             texts.append(result.stdout)
-        self.compiled_resources,self.resource_accounting=compiled_evidence(self.resource_rows,*texts)
+        self.compiled_resources,self.resource_accounting=compiled_evidence(self.resource_rows,*texts,policy=policy)
         require(file_hash(tool)==self.identity['tool_sha256']['cuobjdump']
                 and file_hash(self.path)==self.identity['binary_sha256'],'FP8 token8 admitted binary/tool drift')
         self.identity.update(device=self.device,resource_admitted=True,
@@ -226,9 +269,9 @@ class Binary:
 
     def resources(self):
         rows={}
-        for case,spec in CASES.items():
-            for selected,arm in enumerate(('control128','token8')):
+        for case in self.cases:
+            for selected,arm in enumerate(self.arms):
                 values=(ctypes.c_ulonglong*len(RESOURCE_KEYS))()
-                self.call('token_n8_resources',spec['id'],selected,values)
+                self.call(self.api+'_resources',CASES[case]['id'],selected,values)
                 rows[case+':'+arm]=dict(zip(RESOURCE_KEYS,map(int,values)))
         return rows
