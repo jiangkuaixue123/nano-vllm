@@ -1,0 +1,14 @@
+The optional pool80 policy retains the exact isolated six-function launch binding
+in pool80_launch.cu and the full swapAB derivative in coupled_kernel.cuh.
+The launch file retains its original compilation-only comment as source history;
+current activation is controlled by the documented model-owned opt-in policy.
+
+coupled_kernel.cuh retains NVIDIA Apache-2.0 attribution and differs from the
+original full vendor swapAB kernel only in its symbol and math-register request
+(232 to 80). The derivative uses the existing unmodified vendor headers and N8
+helper. All original license texts, NOTICE.txt and NOTICE-token8.txt apply.
+The inherited full-kernel upstream source digest and packaged derivative hashes
+are recorded in provenance.json. The original binding is MIT code.
+
+This fixed policy does not establish integrated model quality, CUDA Graph state,
+service performance or actual two-CTA residency. Those require separate evidence.

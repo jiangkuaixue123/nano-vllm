@@ -1,5 +1,5 @@
 """Opt-in prepared FP8 consumers; selection is fixed, decode eligibility is per call."""
-from ._fp8_token8_build import Binary, CASES, require
+from ._fp8_token8_build import Binary, CASES, POOL80_CASES, policy_symbols, require
 
 OWNER_CASE = {
     'linear_attn.in_proj_qkvz': 'gdn_input', 'self_attn.qkv_proj': 'fa_input',
@@ -60,18 +60,22 @@ def validate_input(torch,case,q,scales,device):
 class Consumer:
     def __init__(self,torch,projection,case,binary):
         self.torch,self.projection,self.case,self.binary=torch,projection,case,binary
+        require(case in binary.cases, 'FP8 token8 policy/owner geometry')
         self.device=projection.weight.device
         validate_weights(torch,projection,case,self.device)
         self.weights=(tensor_key(projection.weight),tensor_key(projection.weight_scale_inv))
-        self.identity=(binary.identity['source_sha256'],binary.identity['binary_sha256'],binary.device,case,self.weights)
+        self.identity=(binary.identity['source_sha256'],binary.identity['binary_sha256'],binary.device,case,
+                       binary.policy,binary.launch_name,self.weights)
         self.ready=None
 
     def check(self,device,*,capturing):
         p=self.projection
         require(p.fp8_decode_consumer=='token8' and device==self.device
                 and self.torch.cuda.current_device()==self.binary.device,'FP8 token8 fixed selection/device')
-        require(self.binary.identity['resource_admitted'] and self.identity==(
+        require(self.binary.identity['resource_admitted'] and self.binary.identity['policy']==self.binary.policy
+            and self.case in self.binary.cases and self.identity==(
             self.binary.identity['source_sha256'],self.binary.identity['binary_sha256'],self.binary.device,self.case,
+            self.binary.policy,self.binary.launch_name,
             (tensor_key(p.weight),tensor_key(p.weight_scale_inv))), 'FP8 token8 prepared binary/geometry/weight identity')
         if capturing:require(self.ready==self.identity,'Warm the selected token8 consumer eagerly before CUDA Graph capture')
 
@@ -82,7 +86,7 @@ class Consumer:
         self.check(values.device,capturing=torch.cuda.is_current_stream_capturing())
         validate_input(torch,self.case,values,input_scale,self.device)
         output=torch.empty((1,CASES[self.case]['N']),device=self.device,dtype=torch.bfloat16)
-        self.binary.call('token_n8_launch',CASES[self.case]['id'],1,values.data_ptr(),input_scale.data_ptr(),
+        self.binary.call(self.binary.launch_name,CASES[self.case]['id'],1,values.data_ptr(),input_scale.data_ptr(),
             weight.data_ptr(),weight_scale.data_ptr(),output.data_ptr(),torch.cuda.current_stream(self.device).cuda_stream)
         self.ready=self.identity
         return output
@@ -96,8 +100,9 @@ def consumer_for(projection,device,route):
 
 
 class ModelConsumers:
-    def __init__(self,torch,model,owners,binary):
+    def __init__(self,torch,model,owners,binary,pool80=None):
         self.torch,self.model_id,self.owners,self.binary=torch,id(model),tuple(owners),binary
+        self.pool80=pool80
         self.routes=route_identity(model)
 
     def begin_forward(self,model,state,input_ids):
@@ -113,16 +118,23 @@ class ModelConsumers:
 
     def snapshot(self):
         return dict(backend='token8',prepared=True,owners=len(self.owners),case_counts=dict(COUNTS),
+            policy='pool80' if self.pool80 is not None else 'original',
+            case_policies={case:'pool80' if self.pool80 is not None and case in POOL80_CASES else 'original' for case in CASES},
             identity=dict(self.binary.identity),resources=self.binary.resource_rows,
             compiled_resources=self.binary.compiled_resources,resource_accounting=self.binary.resource_accounting,
+            pool80=None if self.pool80 is None else dict(identity=dict(self.pool80.identity),
+                resources=self.pool80.resource_rows,compiled_resources=self.pool80.compiled_resources,
+                resource_accounting=self.pool80.resource_accounting,
+                owners=sum(p._token8_binding.binary is self.pool80 for _,p in self.owners)),
             ready_owners=sum(p._token8_binding.ready is not None for _,p in self.owners),
             host_calls={case:sum(p.kernel_calls['token8'] for _,p in self.owners if p._token8_binding.case==case) for case in CASES})
 
 
-def prepare_model(model):
+def prepare_model(model,*,policy='original'):
     """Called once after original weights load, before any model forward/capture."""
     import torch
     from .quant import FP8Linear
+    policy_symbols(policy)
     require(not torch.cuda.is_current_stream_capturing(),'Prepare token8 eagerly before model execution')
     require(not hasattr(model,'_fp8_token8_runtime'),'FP8 token8 model already prepared')
     route_identity(model)
@@ -146,9 +158,12 @@ def prepare_model(model):
     require(all(p.weight.device==owners[0][1].weight.device for _,p in owners), 'FP8 token8 one-device model')
     with torch.cuda.device(owners[0][1].weight.device):
         binary=Binary(torch)
+        pool80=Binary(torch,policy='pool80') if policy=='pool80' else None
         for name,p in owners:
-            p._token8_binding=Consumer(torch,p,OWNER_CASE[name.split('.',3)[3]],binary)
+            case=OWNER_CASE[name.split('.',3)[3]]
+            selected=pool80 if pool80 is not None and case in POOL80_CASES else binary
+            p._token8_binding=Consumer(torch,p,case,selected)
             p._token8_active=False
-    runtime=ModelConsumers(torch,model,owners,binary)
+    runtime=ModelConsumers(torch,model,owners,binary,pool80)
     model._fp8_token8_runtime=runtime
     return runtime.snapshot()
