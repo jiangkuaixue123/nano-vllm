@@ -341,7 +341,8 @@ the prepared single-token input, MLP gate/up, MLP down and GDN output routes.
 The default is `native`. Selection is fixed when projections are constructed
 and survives projection merging. It requires merged FP8 projections, a
 FlashInfer small-M backend, and the existing input-RMS, postnorm, SwiGLU and GDN
-output FP8 producers set to `triton` (including `NANOVLLM_GDN_OUTNORM=triton`).
+output FP8 producers set to `triton` (including `NANOVLLM_GDN_OUTNORM=triton`
+and `NANOVLLM_MLP_ACTIVATION=triton`).
 Prefill, fresh singleton prefill, multi-token calls and the ordinary BF16-input
 full-attention output projection retain their native consumers.
 

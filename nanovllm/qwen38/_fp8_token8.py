@@ -18,8 +18,8 @@ def route_identity(model):
     routes=[]
     for index,layer in enumerate(layers):
         selected=(layer.input_rms_fp8_backend,layer.mlp.postnorm_fp8_backend,
-                  layer.mlp.silu_fp8_backend)
-        require(selected==('triton',)*3, 'FP8 token8 requires prepared input/postnorm/SwiGLU producers')
+                  layer.mlp.silu_fp8_backend,layer.mlp.activation_backend)
+        require(selected==('triton',)*4, 'FP8 token8 requires prepared input/postnorm/SwiGLU producers and activation')
         if index%4!=3:
             gdn=layer.linear_attn
             selected+=(gdn.outnorm_fp8_backend,gdn.norm.outnorm_backend)

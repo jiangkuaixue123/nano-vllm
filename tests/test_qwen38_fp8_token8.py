@@ -49,9 +49,21 @@ def setup(case="gate_up"):
 
 
 def model():
-    layers = [NS(input_rms_fp8_backend="triton", mlp=NS(postnorm_fp8_backend="triton", silu_fp8_backend="triton"),
+    layers = [NS(input_rms_fp8_backend="triton", mlp=NS(postnorm_fp8_backend="triton", silu_fp8_backend="triton", activation_backend="triton"),
                  linear_attn=NS(outnorm_fp8_backend="triton", norm=NS(outnorm_backend="triton"))) for _ in range(64)]
     return NS(model=NS(layers=layers))
+
+
+def test_actual_swiglu_activation_prerequisite_is_admitted_before_execution():
+    execution = execute([function("_silu_fp8.py", "execution")], {})["execution"]
+    observed = execution(None, None, None, "triton", "native")
+    assert observed["selected_backend"] == "native"
+    assert observed["fallback_reason"] == "requires_triton_mlp_activation"
+    m = model()
+    assert TOKEN["route_identity"](m)
+    m.model.layers[-1].mlp.activation_backend = "native"
+    with pytest.raises(RuntimeError, match="activation"):
+        TOKEN["route_identity"](m)
 
 
 @pytest.mark.parametrize("case", list(BUILD["CASES"]))
