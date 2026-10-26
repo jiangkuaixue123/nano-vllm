@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "source": "FlashInfer installed distribution, wheel RECORD authenticated; upstream NVIDIA TensorRT-LLM / DeepSeek headers",
+  "upstream": "https://github.com/flashinfer-ai/flashinfer",
+  "vendor_files": {
+    "vendor/fp8_gemm_impl.cuh": {
+      "upstream_path": "data/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh",
+      "sha256": "ef50513aa97f71be559a9a8191977f2b254768a74e46de1edbb9717b79dd54dc",
+      "bytes": 37989
+    },
+    "vendor/mma_utils.cuh": {
+      "upstream_path": "data/csrc/nv_internal/tensorrt_llm/deep_gemm/mma_utils.cuh",
+      "sha256": "b56db5a8c03a283c5a26119bf898a9b79b203e06229656bafa6dbfae9a84bb83",
+      "bytes": 47732
+    },
+    "vendor/scheduler.cuh": {
+      "upstream_path": "data/csrc/nv_internal/tensorrt_llm/deep_gemm/scheduler.cuh",
+      "sha256": "dbe76fea0106b1147645862837b8d3ad85349e2a742affabdf32bb9fba436a47",
+      "bytes": 27862
+    },
+    "vendor/tma_utils.cuh": {
+      "upstream_path": "data/csrc/nv_internal/tensorrt_llm/deep_gemm/tma_utils.cuh",
+      "sha256": "0ae8184fc2ffff63c3803693d12f97ade61cae8f56f142a853c2cf1f955c5935",
+      "bytes": 5094
+    },
+    "vendor/utils.cuh": {
+      "upstream_path": "data/csrc/nv_internal/tensorrt_llm/deep_gemm/utils.cuh",
+      "sha256": "615428aa83e007841a9214ba7e20d091a2402aaebacd47d8122eb1f60e054a7b",
+      "bytes": 2664
+    },
+    "vendor/nvrtc_cutlass.cuh": {
+      "upstream_path": "data/csrc/nv_internal/tensorrt_llm/deep_gemm/nvrtc_cutlass.cuh",
+      "sha256": "b15184b992aee69dea85ed82e04831f674145519afc4b645a56e55e1c3a0ad77",
+      "bytes": 89058
+    }
+  },
+  "native_quantizer_sources": {
+    "gemm/gemm_base.py": {
+      "sha256": "6ab2f4f8496b8fff54319a299565dbb41858012edf54f86c721578504a34108c",
+      "bytes": 385023
+    },
+    "jit/gemm/fp8_blockscale.py": {
+      "sha256": "4e150b5033a7f95277153e50828888a6a031de3d8ac4dcf9d5873be228f4a9dc",
+      "bytes": 2207
+    },
+    "data/csrc/fp8_blockscale_gemm_sm90_binding.cu": {
+      "sha256": "02697984190fcf926a47c57da15cf06b5216b22d29efc8f6da71b0b37cb0ba50",
+      "bytes": 9757
+    },
+    "data/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu": {
+      "sha256": "41262d1099c58db16ba56d7469e142f49139b42bbc44428a7a15ba6f4e499486",
+      "bytes": 16661
+    },
+    "data/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh": {
+      "sha256": "b0633a435cd15e29ac420d91d41e3084eef816ceb39f1c861742cbb4049615ec",
+      "bytes": 74838
+    }
+  },
+  "license": "Vendor headers retain their original SPDX notices. Binding is original nano-vllm code; unmarked FlashInfer FFI source is not copied.",
+  "derivative": {
+    "scope": "Five fixed M1 geometries with unchanged full swapAB M128/K128/eight-stage N8 candidate and N16 controls; no producer or quantizer changes",
+    "new_files": [
+      "token8_mma.cuh",
+      "launch.cu"
+    ],
+    "installed_runtime_modified": false,
+    "original_vendor_bytes_preserved": true
+  }
+}

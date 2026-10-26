@@ -25,3 +25,6 @@ Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nanovllm*"]
+
+[tool.setuptools.package-data]
+"nanovllm.qwen38" = ["csrc/fp8_token8/*.cu", "csrc/fp8_token8/*.cuh", "csrc/fp8_token8/*.json", "csrc/fp8_token8/*.txt", "csrc/fp8_token8/vendor/*.cuh"]

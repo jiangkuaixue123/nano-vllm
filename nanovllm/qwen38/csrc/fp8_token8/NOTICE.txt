@@ -1,0 +1,10 @@
+The optional fixed-shape FP8 token-axis N8 consumer uses unchanged device headers distributed
+by FlashInfer, containing NVIDIA TensorRT-LLM and DeepSeek code. Each header
+retains its SPDX copyright/license notices. NVIDIA contributions are Copyright
+(c) 2025 NVIDIA CORPORATION & AFFILIATES, Apache-2.0; marked DeepSeek contributions
+are Copyright (c) 2025 DeepSeek, MIT. License texts are alongside the packaged
+headers. Exact content hashes/upstream relative paths are recorded
+in nanovllm/qwen38/csrc/fp8_token8/provenance.json. The CUDA host binding
+and Python preparation/dispatch are original model-owned MIT code. The unmarked
+FlashInfer FFI binding is referenced for ABI analysis but is not redistributed.
+https://github.com/flashinfer-ai/flashinfer

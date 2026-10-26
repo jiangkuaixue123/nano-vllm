@@ -297,7 +297,8 @@ def test_service_counters_expose_successful_host_calls_without_replay_claim():
                 and ast.unparse(n.targets[0]) == "execution['gdn_outnorm_fp8_execution']")
     gdn = {"layer0": SimpleNamespace(outnorm_fp8_calls={"native": 2, "triton": 3}),
            "layer1": SimpleNamespace(outnorm_fp8_calls={"native": 2, "triton": 3})}
-    ns = execute([node], {"gdn": gdn, "execution": {}})
+    ns = execute([node], {"gdn": gdn, "execution": {},
+                          "consumer": "flashinfer.fp8_blockscale_gemm_sm90_prequantized"})
     info = ns["execution"]["gdn_outnorm_fp8_execution"]
     assert info["calls"] == {"native": 4, "triton": 6}
     assert info["per_module_calls"] == {name: m.outnorm_fp8_calls for name, m in gdn.items()}
